@@ -1,0 +1,3881 @@
+=== File 1 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\multimodal\src\autogluon\multimodal\data\process_mmlab\process_mmocr.py
+File Name: process_mmocr.py
+
+Code:
+import logging
+from typing import Dict, List, Optional
+
+import numpy as np
+import PIL
+from PIL import ImageFile
+from torch import nn
+
+try:
+    from torchvision.transforms import InterpolationMode
+
+    BICUBIC = InterpolationMode.BICUBIC
+except ImportError:
+    BICUBIC = PIL.Image.BICUBIC
+
+from ...constants import AUTOMM
+from ..utils import is_rois_input
+from .process_mmlab_base import MMLabProcessor
+
+logger = logging.getLogger(__name__)
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+class MMOcrProcessor(MMLabProcessor):
+    """
+    Prepare data for mmocr models.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        max_img_num_per_col: Optional[int] = 1,
+        missing_value_strategy: Optional[str] = "zero",
+        requires_column_info: bool = False,
+    ):
+        """
+        Parameters
+        ----------
+        model
+            The model using this data processor.
+        max_img_num_per_col
+            The maximum number of images one sample can have.
+        missing_value_strategy
+            How to deal with a missing image. We now support:
+            - skip
+                Skip this sample
+            -zero
+                Use an image with zero pixels.
+        requires_column_info
+            Whether to require feature column information in dataloader.
+        """
+        from ...utils import CollateMMOcr
+
+        super().__init__(
+            model=model,
+            collate_func=CollateMMOcr,
+            max_img_num_per_col=max_img_num_per_col,
+            missing_value_strategy=missing_value_strategy,
+            requires_column_info=requires_column_info,
+        )
+
+    def process_one_sample(
+        self,
+        image_paths: Dict[str, List[str]],
+        is_training: bool,
+    ) -> Dict:
+        """
+        Read images, process them, and stack them. One sample can have multiple images,
+        resulting in a tensor of (n, 3, size, size), where n <= max_img_num_per_col is the available image number.
+
+        Parameters
+        ----------
+        image_paths
+            One sample may have multiple image columns in a pd.DataFrame and multiple images
+            inside each image column.
+        is_training
+            Whether to process images in the training mode.
+
+        Returns
+        -------
+        A dictionary containing one sample's images and their number.
+        """
+        # TODO: modify for MMOCR
+        mm_data = dict(img_prefix=None, bbox_fields=[])
+        ret = {}
+
+        for per_col_name, per_col_content in image_paths.items():
+            if is_rois_input(per_col_content):
+                rois = np.array(per_col_content)
+                mm_data["ann_info"] = dict(bboxes=rois[:, :4], labels=rois[:, 4])
+            else:
+                with PIL.Image.open(per_col_content[0]) as img:
+                    mm_data["img_info"] = dict(filename=per_col_content[0], height=img.height, width=img.width)
+        if self.requires_column_info:
+            pass  # TODO
+
+        ret.update({self.image_key: self.train_processor(mm_data) if is_training else self.val_processor(mm_data)})
+
+        return ret
+
+
+Summary:
+Class MMOcrProcessor: A data processor for mmocr models that reads, processes, and stacks images with support for multiple images per sample, returning a dictionary with the processed images and their count.
+
+Code Element Summaries:
+- Class `MMOcrProcessor`: A data processor class for preparing data for mmocr models by reading, processing, and stacking images with support for multiple images per sample.
+- Function `__init__`: Initializes a data processor with parameters including the model, maximum image number per sample, missing image strategy, and requirement for feature column information.
+- Function `process_one_sample`: Reads and processes images, stacking them into a tensor, potentially with multiple images per sample, returning a dictionary with the processed images and their count.
+
+
+=== File 2 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\features\tests\features\generators\test_dummy.py
+File Name: test_dummy.py
+
+Code:
+from pandas import DataFrame
+
+from autogluon.features.generators import DummyFeatureGenerator
+
+
+def test_dummy_feature_generator(generator_helper, data_helper):
+    # Given
+    input_data = data_helper.generate_multi_feature_full()
+
+    generator = DummyFeatureGenerator()
+
+    expected_feature_metadata_in_full = {}
+    expected_feature_metadata_full = {("int", ()): ["__dummy__"]}
+
+    output_data = generator_helper.fit_transform_assert(
+        input_data=input_data,
+        generator=generator,
+        expected_feature_metadata_in_full=expected_feature_metadata_in_full,
+        expected_feature_metadata_full=expected_feature_metadata_full,
+    )
+
+    assert output_data.equals(DataFrame(data=[0, 0, 0, 0, 0, 0, 0, 0, 0], columns=["__dummy__"]))
+
+
+Summary:
+Function `test_dummy_feature_generator`: Tests the functionality of generating dummy features using a DummyFeatureGenerator class.
+
+Code Element Summaries:
+- Function `test_dummy_feature_generator`: Tests the functionality of generating dummy features using a DummyFeatureGenerator class.
+
+
+=== File 3 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\core\src\autogluon\core\learner\abstract_learner.py
+File Name: abstract_learner.py
+
+Code:
+import os
+import random
+import sys
+from typing import Optional, Type
+
+from autogluon.core.trainer import AbstractTrainer
+from autogluon.core.utils.loaders import load_pkl
+from autogluon.core.utils.savers import save_json, save_pkl
+
+
+class AbstractLearner:
+    """Abstract class for autogluon Learners. Learners encompass the learning problem end to end,
+    including loading initial data, feature generation, model training, model prediction. Similar
+    to Trainers, they implement `fit` and `predict` methods. The abstract method also includes
+    concrete implementations of serialization/deserialization methods. Refer to individual
+    documentations of concrete learner classes for further information.
+    """
+
+    learner_info_json_name = "info.json"
+    learner_info_name = "info.pkl"
+    learner_file_name = "learner.pkl"
+
+    def __init__(self, path_context: str, random_state: int = 0, **kwargs):
+        self.path, self.model_context, self.save_path = self.create_contexts(path_context)
+
+        self.path_context_og: str = path_context  # Saves path_context used to create the original context of the learner to enable sub-fits.
+        self.is_trainer_present: bool = False
+        self.trainer: Optional[AbstractTrainer] = None
+        self.trainer_type: Optional[Type] = None
+        self.trainer_path: Optional[str] = None
+        self.reset_paths: bool = False
+
+        if random_state is None:
+            random_state = random.randint(0, 1000000)
+        self.random_state = random_state
+
+        try:
+            from ..version import __version__  # noqa
+
+            self.version = __version__
+        except ImportError:
+            self.version = None
+        self._python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+
+    def create_contexts(self, path_context: str):
+        """Create and return paths to save model objects, the learner object.
+
+        Parameters
+        ----------
+        path_context: str
+            Top-level directory where models and trainer will be saved.
+        """
+        model_context = os.path.join(path_context, "models")
+        save_path = os.path.join(path_context, self.learner_file_name)
+        return path_context, model_context, save_path
+
+    def set_contexts(self, path_context: str):
+        """Update the path where model, learner, and trainer objects will be saved.
+        Also see `create_contexts`."""
+        self.path, self.model_context, self.save_path = self.create_contexts(path_context)
+
+    @property
+    def is_fit(self):
+        return self.trainer_path is not None or self.trainer is not None
+
+    def fit(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def predict(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def score(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def leaderboard(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def save(self):
+        trainer = None
+        if self.trainer is not None:
+            if not self.is_trainer_present:
+                self.trainer.save()
+                trainer = self.trainer
+                self.trainer = None
+        save_pkl.save(path=self.save_path, object=self)
+        self.trainer = trainer
+
+    @classmethod
+    def load(cls, path_context, reset_paths=True):
+        load_path = os.path.join(path_context, cls.learner_file_name)
+        obj = load_pkl.load(path=load_path)
+        if reset_paths:
+            obj.set_contexts(path_context)
+            if obj.trainer_path is not None:
+                obj.trainer_path = obj.model_context
+            obj.reset_paths = reset_paths
+            # TODO: Still have to change paths of models in trainer + trainer object path variables
+            return obj
+        else:
+            obj.set_contexts(obj.path_context)
+            return obj
+
+    def save_trainer(self, trainer):
+        if self.is_trainer_present:
+            self.trainer = trainer
+            self.save()
+        else:
+            self.trainer_path = trainer.path
+            trainer.save()
+
+    def load_trainer(self) -> AbstractTrainer:
+        if self.trainer is not None:
+            return self.trainer
+        else:
+            if self.trainer_path is None:
+                raise AssertionError("Trainer does not exist.")
+            # trainer_path is used to determine if there's a trained trainer
+            # model_context contains the new trainer_path with updated context
+            return self.trainer_type.load(path=self.model_context, reset_paths=self.reset_paths)  # noqa
+
+    # reset_paths=True if the learner files have changed location since fitting.
+    # TODO: Potentially set reset_paths=False inside load function if it is the same path to
+    # TODO: avoid re-computing paths on all models path_context -> path for v0.1
+    @classmethod
+    def load_info(cls, path, reset_paths=True, load_model_if_required=True):
+        load_path = os.path.join(path, cls.learner_info_name)
+        try:
+            return load_pkl.load(path=load_path)
+        except Exception as e:
+            if load_model_if_required:
+                learner = cls.load(path_context=path, reset_paths=reset_paths)
+                return learner.get_info()
+            else:
+                raise e
+
+    def save_info(self, include_model_info=False):
+        info = self.get_info(include_model_info=include_model_info)
+
+        save_pkl.save(path=os.path.join(self.path, self.learner_info_name), object=info)
+        save_json.save(path=os.path.join(self.path, self.learner_info_json_name), obj=info)
+        return info
+
+    def get_info(self, **kwargs):
+        learner_info = {
+            "path": self.path,
+            "random_state": self.random_state,
+            "version": self.version,
+        }
+
+        return learner_info
+
+
+Summary:
+Class AbstractLearner: An abstract class for autogluon Learners that encapsulates the end-to-end learning process, including data loading, feature generation, model training, and prediction with methods for saving, loading, and accessing learner information.
+
+Code Element Summaries:
+- Class AbstractLearner: An abstract class for autogluon Learners that encapsulates the end-to-end learning process, including data loading, feature generation, model training, and prediction.
+- Function `__init__`: Initializes the object with specified path context, random state, and additional attributes.
+- Function `create_contexts`: Generates and returns paths for saving model objects and the learner object within a specified top-level directory.
+- Function `set_contexts`: Updates the saving path for model, learner, and trainer objects.
+- Function `is_fit`: Returns True if either `trainer_path` or `trainer` is not None.
+- Function `fit`: A placeholder method that raises NotImplementedError when called.
+- Function `predict`: A placeholder function that raises a NotImplementedError when called.
+- Function `score`: A placeholder function that raises a NotImplementedError when called.
+- Function `leaderboard`: A placeholder function that raises a NotImplementedError when called.
+- Function `save`: Saves the object and its trainer if present, then saves the object in a .pkl file at the specified path.
+- Function `load`: A method to load an object from a specified path context, with an option to reset paths associated with the object.
+- Function `save_trainer`: Saves a trainer object to the database if it is present, otherwise updates the trainer path.
+- Function `load_trainer`: A method that loads a trained trainer using the specified trainer type and model context.
+- Function `load_info`: A method to load information from a specified path, with options to reset paths and load the model if required.
+- Function `save_info`: Saves information in both pickle and JSON formats at specified paths and returns the saved information.
+- Function `get_info`: Returns information about a learner including path, random state, and version.
+
+
+=== File 4 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\core\tests\unittests\test_parallel_local_folding.py
+File Name: test_parallel_local_folding.py
+
+Code:
+import math
+import time
+from unittest.mock import patch
+
+import numpy as np
+import pandas as pd
+
+from autogluon.common import space
+from autogluon.common.utils.resource_utils import ResourceManager
+from autogluon.core.models import AbstractModel
+from autogluon.core.models.ensemble.bagged_ensemble_model import \
+    BaggedEnsembleModel
+from autogluon.core.models.ensemble.fold_fitting_strategy import (
+    FoldFittingStrategy, ParallelLocalFoldFittingStrategy)
+from autogluon.core.ray.resources_calculator import CpuResourceCalculator
+from autogluon.core.searcher import LocalRandomSearcher
+
+NUM_CPU = 8
+NUM_GPU = 1
+
+
+class DummyBigModel(AbstractModel):
+    def _estimate_memory_usage(self, **kwargs):
+        return 1e9
+
+
+def _prepare_data():
+    # prepare an all numeric data so that we don't need to clean labels and features
+    data = [[1, 10], [2, 20], [3, 30]]
+    df = pd.DataFrame(data, columns=["Number", "Age"])
+    label = "Age"
+    X = df.drop(columns=[label])
+    y = df[label]
+    return X, y
+
+
+def _construct_dummy_fold_strategy(
+    num_jobs, model_base_cls=AbstractModel, time_limit=None, num_folds_parallel=8
+):
+    dummy_model_base = model_base_cls()
+    dummy_bagged_ensemble_model = BaggedEnsembleModel(dummy_model_base)
+    train_data, test_data = _prepare_data()
+    args = dict(
+        model_base=dummy_model_base,
+        model_base_kwargs=dict(),
+        bagged_ensemble_model=dummy_bagged_ensemble_model,
+        X=train_data,
+        y=test_data,
+        X_pseudo=None,
+        y_pseudo=None,
+        sample_weight=None,
+        time_limit=time_limit,
+        time_start=time.time(),
+        models=[],
+        oof_pred_proba=np.array([]),
+        oof_pred_model_repeats=np.array([]),
+        save_folds=True,
+        num_cpus=NUM_CPU,
+        num_gpus=NUM_GPU,
+        num_jobs=num_jobs,
+        num_folds_parallel=num_folds_parallel,
+        time_limit_fold_ratio=1,
+        max_memory_usage_ratio=1,
+    )
+    return ParallelLocalFoldFittingStrategy(**args)
+
+
+def _test_resource_allocation_and_time_limit(num_jobs, num_folds_parallel, time_limit):
+    num_cpus = NUM_CPU
+    num_gpus = NUM_GPU
+    time_start = time.time()
+    fold_fitting_strategy = _construct_dummy_fold_strategy(
+        num_jobs=num_jobs, time_limit=time_limit, num_folds_parallel=num_folds_parallel
+    )
+    for i in range(num_jobs):
+        fold_fitting_strategy.schedule_fold_model_fit(dict())
+    resources, batches, num_parallel_jobs = (
+        fold_fitting_strategy.resources,
+        fold_fitting_strategy.batches,
+        fold_fitting_strategy.num_parallel_jobs,
+    )
+    time_elapsed = time.time() - time_start
+    time_remaining = time_limit - time_elapsed
+    time_limit_fold = fold_fitting_strategy._get_fold_time_limit()
+    num_cpus_per_job = resources.get("num_cpus", 0)
+    num_gpus_per_job = resources.get("num_gpus", 0)
+    assert batches >= 1
+    if batches > 1:
+        assert num_jobs <= num_parallel_jobs * batches <= (num_jobs + num_parallel_jobs)
+    assert num_cpus_per_job * num_parallel_jobs <= num_cpus
+    if num_gpus != 0:
+        assert num_gpus_per_job * num_parallel_jobs <= num_gpus
+    else:
+        assert num_gpus_per_job == 0
+    assert math.isclose(time_limit_fold, (time_remaining / batches), abs_tol=0.5)
+
+
+def test_resource_allocation_and_time_limit():
+    num_iterations = 100
+
+    search_space = dict(
+        num_jobs=space.Int(1, 100),
+        num_folds_parallel=space.Int(1, 200),
+        time_limit=space.Int(60, 60 * 60 * 24),
+    )
+
+    searcher = LocalRandomSearcher(search_space=search_space)
+
+    for i in range(num_iterations):
+        config = searcher.get_config()
+        _test_resource_allocation_and_time_limit(**config)
+
+
+@patch(
+    "autogluon.common.utils.resource_utils.ResourceManager.get_available_virtual_mem"
+)
+@patch(
+    "autogluon.core.ray.resources_calculator.ResourceCalculatorFactory.get_resource_calculator"
+)
+def test_dynamic_resource_allocation(resource_cal, mock_get_mem):
+    mock_get_mem.return_value = 2.5 * 1e9
+    resource_cal.return_value = CpuResourceCalculator()
+    fold_fitting_strategy = _construct_dummy_fold_strategy(
+        model_base_cls=DummyBigModel, num_jobs=8, num_folds_parallel=8
+    )
+    assert (
+        fold_fitting_strategy.num_parallel_jobs == 2
+        and fold_fitting_strategy.batches == 4
+    )
+    mock_get_mem.return_value = 7.5 * 1e9
+    fold_fitting_strategy = _construct_dummy_fold_strategy(
+        model_base_cls=DummyBigModel, num_jobs=8, num_folds_parallel=8
+    )
+    # If memory is not sufficient to train num_folds_parallel, reduce to max power of 2 folds that's smaller than folds_can_be_fit_in_parallel.
+    # Here memory can only train 7 folds, therefore we train 4 folds instead in two batches
+    assert (
+        fold_fitting_strategy.num_parallel_jobs == 4
+        and fold_fitting_strategy.batches == 2
+    )
+    mock_get_mem.return_value = 6 * 1e9
+    fold_fitting_strategy = _construct_dummy_fold_strategy(
+        model_base_cls=DummyBigModel, num_jobs=10, num_folds_parallel=10
+    )
+    # Here memory can only train 10 folds, therefore we train 4 folds instead in three batches, the last batch would train 2 folds in parallel
+    assert (
+        fold_fitting_strategy.num_parallel_jobs == 4
+        and fold_fitting_strategy.batches == 3
+    )
+
+
+Summary:
+Class DummyBigModel: A memory estimation model with functions for dataset preparation, fold strategy construction, and resource allocation testing in a parallel processing environment.
+
+Code Element Summaries:
+- Class DummyBigModel: A model that estimates memory usage with a return value of 1e9.
+- Function `_estimate_memory_usage`: A function that estimates memory usage and returns a value of 1e9.
+- Function `_prepare_data`: Generates a numeric dataset with columns "Number" and "Age" for machine learning tasks, separating the target variable "Age" from the features.
+- Function `_construct_dummy_fold_strategy`: Constructs and returns a ParallelLocalFoldFittingStrategy object with specified parameters for dummy model training.
+- Function `_test_resource_allocation_and_time_limit`: A function that tests resource allocation and time limits for job scheduling in a parallel processing environment.
+- Function `test_resource_allocation_and_time_limit`: Tests resource allocation and time limit constraints by iterating through configurations generated by a LocalRandomSearcher.
+- Function `test_dynamic_resource_allocation`: A test function to validate dynamic resource allocation based on memory availability for training folds in parallel.
+
+
+=== File 5 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\multimodal\src\autogluon\multimodal\optimization\lit_matcher.py
+File Name: lit_matcher.py
+
+Code:
+import logging
+from typing import Callable, Dict, List, Optional, Union
+
+import lightning.pytorch as pl
+import torch
+import torchmetrics
+from lightning.pytorch.utilities import grad_norm
+from omegaconf import DictConfig
+from torch import nn
+from torch.nn.modules.loss import _Loss
+from torchmetrics.aggregation import BaseAggregator
+
+from ..constants import FEATURES, LOGIT_SCALE, PROBABILITY, QUERY, RESPONSE
+from ..models.utils import run_model
+from ..utils.matcher import compute_matching_probability
+from .losses import MultiNegativesSoftmaxLoss
+from .utils import (
+    CustomHitRate,
+    apply_layerwise_lr_decay,
+    apply_single_lr,
+    apply_two_stages_lr,
+    generate_metric_learning_labels,
+    get_lr_scheduler,
+    get_optimizer,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class MatcherLitModule(pl.LightningModule):
+    """
+    Control the loops for training, evaluation, and prediction. This module is independent of
+    the model definition. This class inherits from the Pytorch Lightning's LightningModule:
+    https://lightning.ai/docs/pytorch/stable/common/lightning_module.html
+    """
+
+    def __init__(
+        self,
+        query_model: nn.Module,
+        response_model: nn.Module,
+        signature: Optional[str] = None,
+        match_label: Optional[int] = None,
+        matches: Optional[List[DictConfig]] = None,
+        optim_type: Optional[str] = None,
+        lr_choice: Optional[str] = None,
+        lr_schedule: Optional[str] = None,
+        lr: Optional[float] = None,
+        lr_decay: Optional[float] = None,
+        end_lr: Optional[Union[float, int]] = None,
+        lr_mult: Optional[Union[float, int]] = None,
+        weight_decay: Optional[float] = None,
+        warmup_steps: Optional[int] = None,
+        loss_func: Optional[_Loss] = None,
+        miner_func: Optional[_Loss] = None,
+        validation_metric: Optional[torchmetrics.Metric] = None,
+        validation_metric_name: Optional[str] = None,
+        custom_metric_func: Callable = None,
+        test_metric: Optional[torchmetrics.Metric] = None,
+        track_grad_norm: Optional[Union[int, str]] = -1,
+    ):
+        """
+        Parameters
+        ----------
+        query_model
+            The query model.
+        response_model
+            The response model.
+        signature
+            query or response.
+        match_label
+            The label of match class.
+        matches
+            A list of DictConfigs, each of which defines one pair of feature column match and the configs
+            to compute the matching loss.
+        optim_type
+            Optimizer type. We now support:
+            - adamw
+            - adam
+            - sgd
+        lr_choice
+            How to set each layer's learning rate. If not specified, the default is a single
+            learnng rate for all layers. Otherwise, we now support two choices:
+            - two_stages
+                The layers in the pretrained models have a small learning rate (lr * lr_mult),
+                while the newly added head layers use the provided learning rate.
+            - layerwise_decay
+                The layers have decreasing learning rate from the output end to the input end.
+                The intuition is that later layers are more task-related, hence larger learning rates.
+        lr_schedule
+            Learning rate schedule. We now support:
+            - cosine_decay
+                Linear warmup followed by cosine decay
+            - polynomial_decay
+                Linear warmup followed by polynomial decay
+        lr
+            Learning rate.
+        lr_decay
+            The learning rate decay factor (0, 1). It is used only when lr_choice is "layerwise_decay".
+        end_lr
+            The final learning rate after decay.
+        lr_mult
+            The learning rate multiplier (0, 1). It is used only when lr_choice is "two_stages".
+        weight_decay
+            The weight decay to regularize layer weights' l2 norm.
+        warmup_steps
+            How many steps to warmup learning rate. If a float (0, 1), it would represent the
+            percentage of steps over all the training steps. The actual number is calculated as
+            "int(warmup_steps * max_steps)". If an integer, it would be the exact step number.
+        loss_func
+            A Pytorch loss module, e.g., nn.CrossEntropyLoss().
+        validation_metric
+            A torchmetrics module used in the validation stage, e.g., torchmetrics.Accuracy().
+        validation_metric_name
+            Name of validation metric in case that validation_metric is a aggregation metric,
+            e.g., torchmetrics.MeanMetric, whose name can't reflect the real metric name.
+        custom_metric_func
+            A customized metric function in case that torchmetrics doesn't have the metric.
+            It is generally used together with torchmetrics' aggregators, e.g., torchmetrics.MeanMetric.
+            Refer to https://github.com/PyTorchLightning/metrics/blob/master/torchmetrics/aggregation.py
+        test_metric
+            A torchmetrics module used in the test stage, e.g., torchmetrics.Accuracy().
+        track_grad_norm
+            Track the p-norm of gradients during training. May be set to ‘inf’ infinity-norm.
+            If using Automatic Mixed Precision (AMP), the gradients will be unscaled before logging them.
+        """
+        super().__init__()
+        self.save_hyperparameters(
+            ignore=[
+                "query_model",
+                "response_model",
+                "validation_metric",
+                "test_metric",
+                "loss_func",
+                "miner_func",
+                "matches",
+            ]
+        )
+        self.query_model = query_model
+        self.response_model = response_model
+        if signature:
+            assert signature in [QUERY, RESPONSE]
+        self.signature = signature
+        self.validation_metric = validation_metric
+        self.validation_metric_name = f"val_{validation_metric_name}"
+
+        if isinstance(validation_metric, BaseAggregator) and custom_metric_func is None:
+            raise ValueError(
+                f"validation_metric {validation_metric} is an aggregation metric,"
+                f"which must be used with a customized metric function."
+            )
+        self.custom_metric_func = custom_metric_func
+
+        self.matches = matches
+        self.match_label = match_label
+        self.reverse_prob = match_label == 0
+
+        logger.debug(f"match label: {match_label}")
+        logger.debug(f"reverse probability: {self.reverse_prob}")
+
+        self.loss_func = loss_func
+        self.miner_func = miner_func
+        self.track_grad_norm = track_grad_norm
+
+    def _compute_loss(
+        self,
+        query_embeddings: torch.Tensor,
+        response_embeddings: torch.Tensor,
+        label: torch.Tensor,
+        logit_scale: Optional[torch.tensor] = None,
+    ):
+        assert query_embeddings.shape == response_embeddings.shape
+
+        if isinstance(self.loss_func, MultiNegativesSoftmaxLoss):
+            loss = self.loss_func(
+                features_a=query_embeddings,
+                features_b=response_embeddings,
+                logit_scale=logit_scale,
+                rank=self.global_rank,
+                world_size=self.trainer.world_size,
+            )
+        else:
+            embeddings = torch.cat([query_embeddings, response_embeddings], dim=0)  # (b*2, d)
+
+            metric_learning_labels = generate_metric_learning_labels(
+                num_samples=len(query_embeddings),
+                match_label=self.match_label,
+                labels=label,
+            )
+            indices_tuple = self.miner_func(
+                embeddings=embeddings,
+                labels=metric_learning_labels,
+            )
+            loss = self.loss_func(
+                embeddings=embeddings,
+                labels=metric_learning_labels,
+                indices_tuple=indices_tuple,
+            )
+
+        return loss
+
+    @staticmethod
+    def _compute_metric_score(
+        metric: torchmetrics.Metric,
+        custom_metric_func: Callable,
+        label: torch.Tensor,
+        query_embeddings: torch.Tensor,
+        response_embeddings: torch.Tensor,
+        logit_scale: Optional[torch.Tensor] = None,
+        reverse_prob: Optional[bool] = False,
+    ):
+        if isinstance(metric, BaseAggregator):
+            metric.update(custom_metric_func(query_embeddings, response_embeddings, label))
+        elif isinstance(metric, CustomHitRate):
+            metric.update(
+                batch_query_embeds=query_embeddings,
+                batch_response_embeds=response_embeddings,
+                logit_scale=logit_scale if logit_scale else None,
+            )
+        else:
+            metric.update(
+                compute_matching_probability(
+                    embeddings1=query_embeddings,
+                    embeddings2=response_embeddings,
+                    reverse_prob=reverse_prob,
+                ),
+                label,
+            )
+
+    def _get_label(self, batch: Dict):
+        label = None
+        if self.response_model.label_key in batch:
+            label = batch[self.response_model.label_key]
+        return label
+
+    def _shared_step(
+        self,
+        batch: Dict,
+    ):
+        query_outputs = run_model(self.query_model, batch)[self.query_model.prefix]
+        query_embeddings = query_outputs[FEATURES]
+
+        response_outputs = run_model(self.response_model, batch)[self.response_model.prefix]
+        response_embeddings = response_outputs[FEATURES]
+
+        logit_scale = (response_outputs[LOGIT_SCALE] if LOGIT_SCALE in response_outputs else None,)
+
+        if isinstance(logit_scale, tuple):
+            logit_scale = logit_scale[0]
+
+        loss = self._compute_loss(
+            query_embeddings=query_embeddings,
+            response_embeddings=response_embeddings,
+            label=self._get_label(batch),
+            logit_scale=logit_scale,
+        )
+        return query_embeddings, response_embeddings, logit_scale, loss
+
+    def training_step(self, batch, batch_idx):
+        """
+        Per training step. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#training-loop
+
+        Parameters
+        ----------
+        batch
+            A dictionary containing the mini-batch data, including both input data and
+            ground-truth labels. The mini-batch data are passed to each individual model,
+            which indexes its required input data by keys with its model prefix. The
+            ground-truth labels are used here to compute the training loss.
+        batch_idx
+            Index of mini-batch.
+
+        Returns
+        -------
+        Average loss of the mini-batch data.
+        """
+        _, _, _, loss = self._shared_step(batch)
+        self.log("train_loss", loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        """
+        Per validation step. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#validation-loop
+
+        Parameters
+        ----------
+        batch
+            A dictionary containing the mini-batch data, including both input data and
+            ground-truth labels. The mini-batch data are passed to each individual model,
+            which indexes its required input data by keys with its model prefix. The
+            ground-truth labels are used here to compute the validation loss and metric.
+            The validation metric is used for top k model selection and early stopping.
+        batch_idx
+            Index of mini-batch.
+        """
+        query_embeddings, response_embeddings, logit_scale, loss = self._shared_step(batch)
+        # By default, on_step=False and on_epoch=True
+        self.log("val_loss", loss)
+
+        self._compute_metric_score(
+            metric=self.validation_metric,
+            custom_metric_func=self.custom_metric_func,
+            query_embeddings=query_embeddings,
+            response_embeddings=response_embeddings,
+            label=self._get_label(batch),
+            logit_scale=logit_scale,
+            reverse_prob=self.reverse_prob,
+        )
+
+        self.log(
+            self.validation_metric_name,
+            self.validation_metric,
+            on_step=False,
+            on_epoch=True,
+        )
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        """
+        Per prediction step. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#prediction-loop
+
+        Parameters
+        ----------
+        batch
+            A dictionary containing the mini-batch data.
+            The mini-batch data are passed to each individual model,
+            which indexes its required input data by keys with its model prefix.
+            Ground-truth labels are not needed for prediction.
+        batch_idx
+            Index of mini-batch.
+        dataloader_idx
+            Index of dataloader.
+        Returns
+        -------
+        A dictionary with the mini-batch's logits and features.
+        """
+        if self.signature == QUERY:
+            embeddings = run_model(self.query_model, batch)[self.query_model.prefix][FEATURES]
+            return {FEATURES: embeddings}
+        elif self.signature == RESPONSE:
+            embeddings = run_model(self.response_model, batch)[self.response_model.prefix][FEATURES]
+            return {FEATURES: embeddings}
+        else:
+            query_embeddings = run_model(self.query_model, batch)[self.query_model.prefix][FEATURES]
+            response_embeddings = run_model(self.response_model, batch)[self.response_model.prefix][FEATURES]
+
+        match_prob = compute_matching_probability(
+            embeddings1=query_embeddings,
+            embeddings2=response_embeddings,
+        )
+        if self.match_label == 0:
+            probability = torch.stack([match_prob, 1 - match_prob]).t()
+        else:
+            probability = torch.stack([1 - match_prob, match_prob]).t()
+
+        return {PROBABILITY: probability}
+
+    def configure_optimizers(self):
+        """
+        Configure optimizer. This function is registered by LightningModule.
+        Refer to https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#configure-optimizers
+        Returns
+        -------
+        [optimizer]
+            Optimizer.
+        [sched]
+            Learning rate scheduler.
+        """
+        # TODO: need to consider query_model and response_model in the optimizer
+        # TODO: how to avoid pass one parameter multiple times in the optimizer?
+        # TODO: in the late-fusion siamese setting, one shared parameter may have different layer ids in the query and response models.
+        kwargs = dict(
+            model=self.query_model,
+            lr=self.hparams.lr,
+            weight_decay=self.hparams.weight_decay,
+        )
+        if self.hparams.lr_choice == "two_stages":
+            logger.debug("applying 2-stage learning rate...")
+            grouped_parameters = apply_two_stages_lr(
+                lr_mult=self.hparams.lr_mult,
+                return_params=True,
+                **kwargs,
+            )
+        elif self.hparams.lr_choice == "layerwise_decay":
+            logger.debug("applying layerwise learning rate decay...")
+            grouped_parameters = apply_layerwise_lr_decay(
+                lr_decay=self.hparams.lr_decay,
+                **kwargs,
+            )
+        else:
+            logger.debug("applying single learning rate...")
+            grouped_parameters = apply_single_lr(
+                **kwargs,
+            )
+
+        optimizer = get_optimizer(
+            optim_type=self.hparams.optim_type,
+            optimizer_grouped_parameters=grouped_parameters,
+            lr=self.hparams.lr,
+            weight_decay=self.hparams.weight_decay,
+        )
+
+        logger.debug(f"trainer.max_steps: {self.trainer.max_steps}")
+        if self.trainer.max_steps is None or -1:
+            max_steps = (
+                len(self.trainer.datamodule.train_dataloader())
+                * self.trainer.max_epochs
+                // self.trainer.accumulate_grad_batches
+            )
+            logger.debug(
+                f"len(trainer.datamodule.train_dataloader()): " f"{len(self.trainer.datamodule.train_dataloader())}"
+            )
+            logger.debug(f"trainer.max_epochs: {self.trainer.max_epochs}")
+            logger.debug(f"trainer.accumulate_grad_batches: {self.trainer.accumulate_grad_batches}")
+        else:
+            max_steps = self.trainer.max_steps
+
+        logger.debug(f"max steps: {max_steps}")
+
+        warmup_steps = self.hparams.warmup_steps
+        if isinstance(warmup_steps, float):
+            warmup_steps = int(max_steps * warmup_steps)
+
+        logger.debug(f"warmup steps: {warmup_steps}")
+        logger.debug(f"lr_schedule: {self.hparams.lr_schedule}")
+        scheduler = get_lr_scheduler(
+            optimizer=optimizer,
+            num_max_steps=max_steps,
+            num_warmup_steps=warmup_steps,
+            lr_schedule=self.hparams.lr_schedule,
+            end_lr=self.hparams.end_lr,
+        )
+
+        sched = {"scheduler": scheduler, "interval": "step"}
+        logger.debug("done configuring optimizer and scheduler")
+        return [optimizer], [sched]
+
+    def on_before_optimizer_step(self, optimizer):
+        # If using mixed precision, the gradients are already unscaled here
+        if self.track_grad_norm != -1:
+            self.log_dict(grad_norm(self, norm_type=self.track_grad_norm))
+
+
+Summary:
+A set of functions within a model training process that handle initialization, loss computation, metric scoring, label retrieval, training/validation/prediction steps, optimizer configuration, and logging of gradient norms.
+
+Code Element Summaries:
+- Function `__init__`: Initializes parameters for a model training process with various options for optimization, learning rate, loss functions, metrics, and more.
+- Function `_compute_loss`: calculates the loss based on query and response embeddings, labels, and specified loss functions.
+- Function `_compute_metric_score`: A function that computes the metric score based on different types of metrics and custom functions provided.
+- Function `_get_label`: Retrieves the label from a batch dictionary based on a specified key in the response model.
+- Function `_shared_step`: A function that runs query and response models on a batch of data to compute loss with embeddings and logit scale.
+- Function `training_step`: Per training step function registered by LightningModule that computes the training loss and logs the average loss of the mini-batch data.
+- Function `validation_step`: A function registered by LightningModule to perform per validation step computations using mini-batch data and ground-truth labels.
+- Function `predict_step`: A function registered by LightningModule for per prediction step, returning a dictionary with mini-batch logits and features based on model signatures.
+- Function `configure_optimizers`: Configures optimizer and scheduler based on LightningModule's parameters.
+- Function `on_before_optimizer_step`: Logs the gradient norm if track_grad_norm is not equal to -1 before the optimizer step.
+
+
+=== File 6 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\features\src\autogluon\features\generators\astype.py
+File Name: astype.py
+
+Code:
+import logging
+
+import numpy as np
+import pandas as pd
+from pandas import DataFrame
+
+from autogluon.common.features.feature_metadata import FeatureMetadata
+from autogluon.common.features.infer_types import get_bool_true_val, get_type_map_raw, get_type_map_real
+from autogluon.common.features.types import R_INT, S_BOOL
+
+from .abstract import AbstractFeatureGenerator
+
+logger = logging.getLogger(__name__)
+
+
+# TODO: Add int fillna input value options: 0, set value, mean, mode, median
+class AsTypeFeatureGenerator(AbstractFeatureGenerator):
+    """
+    Enforces type conversion on the data to match the types seen during fitting.
+    If a feature cannot be converted to the correct type, an exception will be raised.
+
+    Parameters
+    ----------
+    convert_bool : bool, default True
+        Whether to automatically convert features with only two unique values to boolean.
+    convert_bool_method : str, default "auto"
+        [Advanced] The processing method to convert boolean features. Recommended to keep as "auto".
+        If "auto": Will attempt to automatically select the best method based on the data.
+        If "v1": Will use a simple method that was the default prior to v0.7 (`_convert_to_bool_simple`)
+        If "v2": Will use an optimized method that was introduced in v0.7 (`_convert_to_bool_fast`)
+        Note that "v2" is not always faster than "v1", and is often slower when there are few boolean columns.
+        All options produce identical results, except in extreme synthetic edge-cases.
+    convert_bool_method_v2_threshold : int, default 15
+        [Advanced] If `convert_bool_method="auto"`, this value determines which method is used.
+        If the number of boolean features is >= this value, then "v2" is used. Otherwise, "v1" is used.
+        15 is roughly the optimal value on average.
+    convert_bool_method_v2_row_threshold : int, default 128
+        [Advanced] If using "v2" bool method, this is the row count in which when >=, the batch method is used instead of the realtime method.
+        128 is roughly the optimal value on average.
+    **kwargs :
+        Refer to :class:`AbstractFeatureGenerator` documentation for details on valid key word arguments.
+    """
+
+    def __init__(
+        self,
+        convert_bool: bool = True,
+        convert_bool_method: str = "auto",
+        convert_bool_method_v2_threshold: int = 15,
+        convert_bool_method_v2_row_threshold: int = 128,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        # FeatureMetadata object based on the original input features real dtypes
+        # (will contain dtypes such as 'int16' and 'float32' instead of 'int' and 'float').
+        self._feature_metadata_in_real: FeatureMetadata = None
+        self._type_map_real_opt: dict = None  # Optimized representation of data types, saves a few milliseconds during comparisons in online inference
+        # self.inplace = inplace  # TODO, also add check if dtypes are same as expected and skip .astype
+        self._int_features = None
+        self._bool_features = None
+        self._convert_bool = convert_bool
+        self._convert_bool_method_v2_threshold = convert_bool_method_v2_threshold
+        self._convert_bool_method_v2_row_threshold = convert_bool_method_v2_row_threshold
+        if convert_bool_method == "v1":
+            self._use_fast_bool_method = False
+        elif convert_bool_method == "v2":
+            self._use_fast_bool_method = True
+        elif convert_bool_method == "auto":
+            self._use_fast_bool_method = "auto"
+        else:
+            raise ValueError(
+                f"Unknown `convert_bool_method` value: {convert_bool_method}. " f'Valid values: ["v1", "v2", "auto"]'
+            )
+        self._bool_features_list = None
+        self._non_bool_features_list = None
+        self._bool_features_val = None
+        self._bool_features_val_np = None
+
+    # TODO: consider returning self._transform(X) if we allow users to specify real dtypes as input
+    def _fit_transform(self, X: DataFrame, **kwargs) -> (DataFrame, dict):
+        feature_type_raw_cur_dict = get_type_map_raw(X)
+        feature_map_to_update = dict()
+        type_map_special = self.feature_metadata_in.get_type_map_special()
+        for feature in self.features_in:
+            feature_type_raw = self.feature_metadata_in.get_feature_type_raw(feature)
+            feature_type_raw_cur = feature_type_raw_cur_dict[feature]
+            if feature_type_raw != feature_type_raw_cur:
+                self._log(
+                    30,
+                    f'\tWARNING: Actual dtype differs from dtype in FeatureMetadata for feature "{feature}". '
+                    f"Actual dtype: {feature_type_raw_cur} | Expected dtype: {feature_type_raw}",
+                )
+                feature_map_to_update[feature] = feature_type_raw
+        if feature_map_to_update:
+            self._log(
+                30,
+                "\tWARNING: Forcefully converting features to expected dtypes. "
+                "Please manually align the input data with the expected dtypes if issues occur.",
+            )
+            X = X.astype(feature_map_to_update)
+
+        self._bool_features = dict()
+        if self._convert_bool:
+            num_rows = len(X)
+            if num_rows > 1000:
+                # Sample and filter out features that already have >2 unique values
+                # in the first 500 rows from bool consideration
+                X_nunique_sample = X[self.features_in].head(500).nunique(dropna=False)
+                X_nunique_sample = X_nunique_sample[X_nunique_sample <= 2]
+                bool_candidates = list(X_nunique_sample.index)
+            else:
+                bool_candidates = self.features_in
+            for feature in bool_candidates:
+                if S_BOOL not in type_map_special[feature]:
+                    uniques = X[feature].unique()
+                    if len(uniques) == 2:
+                        feature_bool_val = get_bool_true_val(uniques=uniques)
+                        self._bool_features[feature] = feature_bool_val
+
+        if self._bool_features:
+            self._log(
+                20,
+                f"\tNote: Converting {len(self._bool_features)} features to boolean dtype "
+                f"as they only contain 2 unique values.",
+            )
+            self._set_bool_features_val()
+            if self._use_fast_bool_method == "auto":
+                self._use_fast_bool_method = len(self._bool_features) >= self._convert_bool_method_v2_threshold
+            X = self._convert_to_bool(X)
+            for feature in self._bool_features:
+                type_map_special[feature] = [S_BOOL]
+                self._type_map_real_opt[feature] = np.int8
+            type_group_map_special = FeatureMetadata.get_type_group_map_special_from_type_map_special(type_map_special)
+        else:
+            type_group_map_special = self.feature_metadata_in.type_group_map_special
+        self._int_features = np.array(self.feature_metadata_in.get_features(valid_raw_types=[R_INT]))
+        return X, type_group_map_special
+
+    def _transform(self, X: DataFrame) -> DataFrame:
+        if self._bool_features:
+            X = self._convert_to_bool(X)
+        # check if not same
+        if self._type_map_real_opt != X.dtypes.to_dict():
+            if self._int_features.size:
+                null_count = X[self._int_features].isnull().any()
+                # If int feature contains null during inference but not during fit.
+                if null_count.any():
+                    # TODO: Consider imputing to mode? This is tricky because training data had no missing values.
+                    # TODO: Add unit test for this situation, to confirm it is handled properly.
+                    with_null = null_count[null_count]
+                    with_null_features = list(with_null.index)
+                    logger.warning(
+                        "WARNING: Int features without null values "
+                        "at train time contain null values at inference time! "
+                        "Imputing nulls to 0. To avoid this, pass the features as floats during fit!"
+                    )
+                    logger.warning(f"WARNING: Int features with nulls: {with_null_features}")
+                    X[with_null_features] = X[with_null_features].fillna(0)
+
+            if self._type_map_real_opt:
+                # TODO: Confirm this works with sparse and other feature types!
+                # FIXME: Address situation where test-time invalid type values cause crash:
+                #  https://stackoverflow.com/questions/49256211/how-to-set-unexpected-data-type-to-na?noredirect=1&lq=1
+                try:
+                    X = X.astype(self._type_map_real_opt)
+                except Exception as e:
+                    self._log_invalid_dtypes(X=X)
+                    raise e
+        return X
+
+    def _log_invalid_dtypes(self, X: pd.DataFrame):
+        """
+        Logs detailed information on all feature transformations, including exceptions that occur.
+        """
+        pd_cols = ["feature", "status", "dtype_input", "dtype_to_convert_to", "exception"]
+        rows = []
+
+        logger.log(
+            40,
+            f"Exception encountered in {self.__class__.__name__} ... "
+            f"Please check if feature data types differ between train and test (via df.dtypes).\nException breakdown by feature:",
+        )
+        for f in self._type_map_real_opt.keys():
+            f_type_out = self._type_map_real_opt[f]
+            f_type_in = X[f].dtype
+            try:
+                X[f].astype(f_type_out)
+            except Exception as e:
+                status = f"{e.__class__.__name__}"
+                exception = e
+            else:
+                status = "Success"
+                exception = None
+            row = [f, status, f_type_in, f_type_out, exception]
+            rows.append(row)
+        df_debug = pd.DataFrame(rows, columns=pd_cols)
+        with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 1000):
+            logger.log(40, df_debug)
+
+    def _convert_to_bool(self, X: DataFrame) -> DataFrame:
+        if self._use_fast_bool_method:
+            return self._convert_to_bool_fast(X)
+        else:
+            return self._convert_to_bool_simple(X)
+
+    def _convert_to_bool_simple(self, X: DataFrame) -> DataFrame:
+        """Generic method to convert feature types to booleans. Efficient with small amounts of features."""
+        for feature in self._bool_features_list:
+            # Note, this edits inplace, altering outer context.
+            #  This is ok when used in PipelineFeatureGenerator, as the data is already deep copied.
+            #  We avoid deep copying here to speed up processing.
+            X[feature] = (X[feature] == self._bool_features[feature]).astype(np.int8)
+        return X
+
+    def _convert_to_bool_fast(self, X: DataFrame) -> DataFrame:
+        """
+        Faster method to convert feature types to boolean when many features must be converted at once.
+        Can be >10x faster than the simple version, particularly when len(X) < 100
+
+        Note that the fast method alters the column order with boolean features being last.
+        """
+        if len(X) >= self._convert_bool_method_v2_row_threshold:
+            return self._convert_to_bool_fast_batch(X)
+        else:
+            return self._convert_to_bool_fast_realtime(X)
+
+    def _convert_to_bool_fast_batch(self, X: DataFrame) -> DataFrame:
+        """Optimized for when X is > 100 rows"""
+        X_bool_list = []
+        for feature in self._bool_features_list:
+            X_bool_list.append((X[feature] == self._bool_features[feature]).astype(np.int8))
+        X_bool = pd.concat(X_bool_list, axis=1)
+
+        # TODO: re-order columns to features_in required because `feature_interactions=False` to avoid error when feature prune.
+        #  Note that this is slower than avoiding the re-order, but avoiding the re-order is very complicated to do correctly.
+        return pd.concat([X[self._non_bool_features_list], X_bool], axis=1)[self.features_in]
+
+    def _convert_to_bool_fast_realtime(self, X: DataFrame) -> DataFrame:
+        """Optimized for when X is <= 100 rows"""
+        X_bool_features_np = X[self._bool_features_list].to_numpy(dtype="object")
+        X_bool_numpy = X_bool_features_np == self._bool_features_val_np
+        X_bool = pd.DataFrame(X_bool_numpy, columns=self._bool_features_list, dtype=np.int8, index=X.index)
+
+        # TODO: re-order columns to features_in required because `feature_interactions=False` to avoid error when feature prune.
+        #  Note that this is slower than avoiding the re-order, but avoiding the re-order is very complicated to do correctly.
+        return pd.concat([X[self._non_bool_features_list], X_bool], axis=1)[self.features_in]
+
+    @staticmethod
+    def get_default_infer_features_in_args() -> dict:
+        return dict()
+
+    def _infer_features_in_full(self, X: DataFrame, feature_metadata_in: FeatureMetadata = None):
+        super()._infer_features_in_full(X=X, feature_metadata_in=feature_metadata_in)
+        type_map_real = get_type_map_real(X[self.feature_metadata_in.get_features()])
+        self._type_map_real_opt = X[self.feature_metadata_in.get_features()].dtypes.to_dict()
+        self._feature_metadata_in_real = FeatureMetadata(
+            type_map_raw=type_map_real, type_group_map_special=self.feature_metadata_in.get_type_group_map_raw()
+        )
+
+    def _remove_features_in(self, features):
+        super()._remove_features_in(features)
+        if features:
+            self._feature_metadata_in_real = self._feature_metadata_in_real.remove_features(features=features)
+            for feature in features:
+                self._type_map_real_opt.pop(feature, None)
+                self._bool_features.pop(feature, None)
+            self._set_bool_features_val()
+            self._int_features = np.array(self.feature_metadata_in.get_features(valid_raw_types=[R_INT]))
+
+    def _set_bool_features_val(self):
+        self._bool_features_val = [self._bool_features[f] for f in self._bool_features]
+        self._bool_features_val_np = np.array(self._bool_features_val, dtype="object")
+        self._bool_features_list = list(self._bool_features.keys())
+        self._non_bool_features_list = [f for f in self.features_in if f not in self._bool_features]
+
+    def print_feature_metadata_info(self, log_level=20):
+        self._log(log_level, "\tOriginal Features (exact raw dtype, raw dtype):")
+        self._feature_metadata_in_real.print_feature_metadata_full(
+            self.log_prefix + "\t\t", print_only_one_special=True, log_level=log_level
+        )
+        super().print_feature_metadata_info(log_level=log_level)
+
+    def _more_tags(self):
+        return {"feature_interactions": False}
+
+
+Summary:
+A set of methods and functions for converting boolean values, optimizing data types, inferring features, and handling feature metadata in online inference processes.
+
+Code Element Summaries:
+- Function `__init__`: Initializes the class with specified parameters for converting boolean values and optimizing data types for comparison in online inference.
+- Function `_fit_transform`: A method that fits and transforms input data, converting features to expected data types and handling boolean values.
+- Function `_transform`: A method that transforms a DataFrame by converting boolean features, handling missing values, and adjusting data types based on a specified type map.
+- Function `_log_invalid_dtypes`: Logs detailed information on feature transformations, including exceptions encountered during the process.
+- Function `_convert_to_bool`: A method that converts a DataFrame to boolean values using a fast or simple method based on a specified condition.
+- Function `_convert_to_bool_simple`: A method that efficiently converts feature types to booleans, suitable for small amounts of features.
+- Function `_convert_to_bool_fast`: A faster method to convert feature types to boolean in bulk, which can be significantly faster than the simple version for datasets with less than 100 rows.
+- Function `_convert_to_bool_fast_batch`: An optimized method for converting DataFrame X to boolean values when X contains more than 100 rows.
+- Function `_convert_to_bool_fast_realtime`: An optimized function for converting DataFrame X to boolean values when X has <= 100 rows.
+- Function `get_default_infer_features_in_args`: Returns an empty dictionary as default arguments for inferring features.
+- Function `_infer_features_in_full`: A method that infers features in a DataFrame using provided feature metadata and updates internal feature metadata for real data types.
+- Function `_remove_features_in`: Removes specified features from the object's internal data structures and updates relevant metadata.
+- Function `_set_bool_features_val`: Sets boolean features values and lists for the object.
+- Function `print_feature_metadata_info`: Prints original features' metadata information and then calls the superclass's method to print more metadata information.
+- Function `_more_tags`: Returns a dictionary with the key "feature_interactions" set to False.
+
+
+=== File 7 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\multimodal\src\autogluon\multimodal\utils\misc.py
+File Name: misc.py
+
+Code:
+import base64
+import json
+import logging
+import os
+import re
+
+import numpy as np
+import pandas as pd
+import torch
+from scipy.special import expit, softmax
+
+logger = logging.getLogger(__name__)
+
+
+def logits_to_prob(logits: np.ndarray):
+    """
+    Convert logits to probabilities.
+
+    Parameters
+    ----------
+    logits
+        The logits output of a classification head.
+
+    Returns
+    -------
+    Probabilities.
+    """
+    if logits.ndim == 1:
+        return expit(logits)
+    elif logits.ndim == 2:
+        return softmax(logits, axis=1)
+    else:
+        raise ValueError(f"Unsupported logit dim: {logits.ndim}.")
+
+
+def tensor_to_ndarray(tensor: torch.Tensor):
+    """
+    Convert Pytorch tensor to numpy array.
+
+    Parameters
+    ----------
+    tensor
+        A Pytorch tensor.
+
+    Returns
+    -------
+    A ndarray.
+    """
+    return tensor.detach().cpu().float().numpy()
+
+
+def path_expander(path, base_folder):
+    path_l = path.split(";")
+    return ";".join([os.path.abspath(os.path.join(base_folder, path)) for path in path_l])
+
+
+def _read_byte(file):
+    with open(file, "rb") as image:
+        f = image.read()
+        b = bytearray(f)
+    return b
+
+
+def path_to_bytearray_expander(path, base_folder):
+    path_l = path.split(";")
+    return [_read_byte(os.path.abspath(os.path.join(base_folder, path))) for path in path_l]
+
+
+def _read_base64str(file):
+    with open(file, "rb") as image:
+        f = image.read()
+        image_base64 = base64.b64encode(f)
+        image_base64_str = image_base64.decode("utf-8")
+    return image_base64_str
+
+
+def path_to_base64str_expander(path, base_folder):
+    path_l = path.split(";")
+    return [_read_base64str(os.path.abspath(os.path.join(base_folder, path))) for path in path_l]
+
+
+def shopee_dataset(
+    download_dir: str,
+    is_bytearray=False,
+    is_base64str=False,
+):
+    """
+    Download Shopee dataset for demo.
+
+    Parameters
+    ----------
+    download_dir
+        Path to save the dataset locally.
+
+    Returns
+    -------
+    train and test set of Shopee dataset in pandas DataFrame format.
+    """
+    zip_file = "https://automl-mm-bench.s3.amazonaws.com/vision_datasets/shopee.zip"
+    from autogluon.core.utils.loaders import load_zip
+
+    load_zip.unzip(zip_file, unzip_dir=download_dir)
+
+    dataset_path = os.path.join(download_dir, "shopee")
+
+    train_data = pd.read_csv(f"{dataset_path}/train.csv")
+    test_data = pd.read_csv(f"{dataset_path}/test.csv")
+
+    expander = (
+        path_to_bytearray_expander if is_bytearray else (path_to_base64str_expander if is_base64str else path_expander)
+    )
+    train_data["image"] = train_data["image"].apply(lambda ele: expander(ele, base_folder=dataset_path))
+    test_data["image"] = test_data["image"].apply(lambda ele: expander(ele, base_folder=dataset_path))
+    return train_data, test_data
+
+
+def merge_spans(sent, pred, for_visualizer=False):
+    """Merge subsequent predictions."""
+    if isinstance(pred, str):
+        # For string values, we assume that it is json-encoded string of the sentences.
+        try:
+            pred = json.loads(pred)
+        except Exception as exp:
+            raise RuntimeError(
+                f"The received entity annotations is {pred}, "
+                f"which can not be encoded with the json format. "
+                f"Check your input again, or running `json.loads(pred)` to verify your data."
+            )
+    spans = {}
+    last_start = -1
+    last_end = -1
+    last_label = ""
+    for entity in pred:
+        entity_group = entity["entity_group"]
+        start = entity["start"]
+        end = entity["end"]
+        if (
+            last_start >= 0
+            and not for_visualizer
+            and (not re.match("B-", entity_group, re.IGNORECASE))
+            and (
+                (re.match("I-", entity_group, re.IGNORECASE) and last_label[2:] == entity_group[2:])
+                or last_label == entity_group
+            )
+            and (sent[last_end:start].isspace() or (last_end == start))
+        ):
+            last_end = end
+        else:
+            last_start = start
+            last_end = end
+            last_label = entity_group
+
+        if re.match("B-", last_label, re.IGNORECASE) or re.match("I-", last_label, re.IGNORECASE):
+            spans.update({last_start: (last_end, last_label[2:])})
+        else:
+            spans.update({last_start: (last_end, last_label)})
+    return spans
+
+
+def merge_bio_format(data, preds):
+    """Merge predictions with BIO format during prediction."""
+    results = []
+    for sent, pred in zip(data, preds):
+        results.append(
+            [
+                {"entity_group": value[-1], "start": key, "end": value[0]}
+                for key, value in merge_spans(sent, pred).items()
+            ]
+        )
+    return results
+
+
+Summary:
+A collection of functions for data manipulation, file handling, and dataset retrieval, including converting logits to probabilities, expanding file paths, reading files in different formats, merging entity annotations, and handling image data.
+
+Code Element Summaries:
+- Function `logits_to_prob`: A function that converts logits to probabilities based on the input dimensionality.
+- Function `tensor_to_ndarray`: Converts Pytorch tensor to numpy array.
+- Function `path_expander`: A function that expands file paths by joining them with a base folder and converting them to absolute paths.
+- Function `_read_byte`: Reads a file in binary mode and returns its content as a byte array.
+- Function `path_to_bytearray_expander`: A function that expands a list of file paths into byte arrays by reading and concatenating each file's contents.
+- Function `_read_base64str`: Reads an image file as binary, encodes it in base64, and returns the base64 string representation.
+- Function `path_to_base64str_expander`: A function that expands a list of file paths to base64 strings using a specified base folder.
+- Function `shopee_dataset`: Downloads the Shopee dataset for demonstration purposes and returns the train and test sets in pandas DataFrame format.
+- Function `merge_spans`: A function that merges subsequent predictions from entity annotations.
+- Function `merge_bio_format`: Merges predictions with BIO format for entity recognition during prediction.
+
+
+=== File 8 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\tabular\tests\unittests\edgecases\__init__.py
+File Name: __init__.py
+
+Code:
+
+
+Summary:
+
+
+Code Element Summaries:
+
+
+=== File 9 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\multimodal\tests\unittests\others\test_dump_model.py
+File Name: test_dump_model.py
+
+Code:
+import os
+
+import pytest
+import timm
+import transformers
+
+from autogluon.core.utils.loaders import load_zip
+from autogluon.multimodal import MultiModalPredictor
+from autogluon.multimodal.utils.misc import shopee_dataset
+
+from ..utils.unittest_datasets import AEDataset, PetFinderDataset
+
+ALL_DATASETS = {"petfinder": PetFinderDataset(), "ae": AEDataset()}
+
+
+def test_dump_timm_image():
+    download_dir = "./"
+    model_dump_path = "./timm_image_test"
+    base_model_name = "mobilenetv3_large_100"
+    train_data, _ = shopee_dataset(download_dir=download_dir)
+    predictor_1 = MultiModalPredictor(label="label")
+    hyperparameters = {
+        "optimization.max_epochs": 1,
+        "model.names": ["timm_image_1"],
+        "model.timm_image_1.checkpoint_name": base_model_name,
+    }
+    predictor_1.fit(train_data=train_data, hyperparameters=hyperparameters, time_limit=5, seed=42)
+    predictor_1.dump_model(save_path=model_dump_path)
+    model = timm.create_model(
+        model_name=base_model_name, checkpoint_path=f"{model_dump_path}/timm_image_1/pytorch_model.bin", num_classes=0
+    )
+    assert isinstance(model, timm.models.mobilenetv3.MobileNetV3)
+    predictor_2 = MultiModalPredictor(label="label")
+    hyperparameters = {
+        "optimization.max_epochs": 1,
+        "model.timm_image.checkpoint_name": f"{model_dump_path}/timm_image_1",
+    }
+    predictor_2.fit(train_data=train_data, hyperparameters=hyperparameters, time_limit=5, seed=42)
+
+
+def test_dump_hf_text():
+    model_dump_path = "./hf_text_test"
+    base_model_name = "prajjwal1/bert-tiny"
+    dataset = ALL_DATASETS["ae"]
+    predictor_1 = MultiModalPredictor(
+        label=dataset.label_columns[0], problem_type=dataset.problem_type, eval_metric=dataset.metric
+    )
+    hyperparameters = {
+        "optimization.max_epochs": 1,
+        "model.hf_text.checkpoint_name": base_model_name,
+        "env.num_workers": 0,  # https://github.com/pytorch/pytorch/issues/33296
+    }
+    predictor_1.fit(train_data=dataset.train_df, hyperparameters=hyperparameters, time_limit=5, seed=42)
+    predictor_1.dump_model(save_path=model_dump_path)
+
+    model = transformers.AutoModel.from_pretrained(f"{model_dump_path}/hf_text")
+    assert isinstance(model, transformers.models.bert.modeling_bert.BertModel)
+    predictor_2 = MultiModalPredictor(
+        label=dataset.label_columns[0], problem_type=dataset.problem_type, eval_metric=dataset.metric
+    )
+    hyperparameters = {
+        "optimization.max_epochs": 1,
+        "model.hf_text.checkpoint_name": f"{model_dump_path}/hf_text",
+        "env.num_workers": 0,  # https://github.com/pytorch/pytorch/issues/33296
+    }
+    predictor_2.fit(train_data=dataset.train_df, hyperparameters=hyperparameters, time_limit=5, seed=42)
+
+
+def test_fusion_model_dump():
+    model_dump_path = "./test_fusion_models"
+    dataset = ALL_DATASETS["petfinder"]
+    predictor = MultiModalPredictor(
+        label=dataset.label_columns[0], problem_type=dataset.problem_type, eval_metric=dataset.metric
+    )
+    hyperparameters = {
+        "optimization.max_epochs": 1,
+        "model.names": ["timm_image", "hf_text", "fusion_mlp"],
+        "model.timm_image.checkpoint_name": "ghostnet_100",
+        "model.hf_text.checkpoint_name": "nlpaueb/legal-bert-small-uncased",
+    }
+    predictor.fit(train_data=dataset.train_df, hyperparameters=hyperparameters, time_limit=5, seed=42)
+    predictor.dump_model(save_path=model_dump_path)
+    hf_text_dir = f"{model_dump_path}/hf_text"
+    timm_image_dir = f"{model_dump_path}/timm_image"
+    assert os.path.exists(hf_text_dir) and (len(os.listdir(hf_text_dir)) > 2) == True
+    assert os.path.exists(timm_image_dir) and (len(os.listdir(timm_image_dir)) == 2) == True
+
+
+# TODO: Issue #4126 Skipping object detection tests due to incompatibility of mmdet with Torch 2.2
+@pytest.mark.torch_mmdet
+def test_mmdet_object_detection_save_and_load():
+    zip_file = "https://automl-mm-bench.s3.amazonaws.com/object_detection_dataset/tiny_motorbike_coco.zip"
+    download_dir = "./tiny_motorbike_coco"
+
+    load_zip.unzip(zip_file, unzip_dir=download_dir)
+    data_dir = os.path.join(download_dir, "tiny_motorbike")
+
+    test_path = os.path.join(data_dir, "Annotations", "test_cocoformat.json")
+    # Init predictor
+    predictor = MultiModalPredictor(
+        hyperparameters={
+            "model.mmdet_image.checkpoint_name": "yolov3_mobilenetv2_8xb24-320-300e_coco",
+            "env.num_gpus": -1,
+        },
+        problem_type="object_detection",
+    )
+
+    pred = predictor.predict(test_path)
+
+    model_save_dir = predictor.dump_model()
+    detection_model_save_subdir = os.path.join(model_save_dir, predictor._learner._model.prefix)
+
+    new_predictor = MultiModalPredictor(
+        hyperparameters={"model.mmdet_image.checkpoint_name": detection_model_save_subdir, "env.num_gpus": -1},
+        problem_type="object_detection",
+    )
+    new_pred = new_predictor.predict(test_path)
+
+    assert abs(pred["bboxes"][0][0]["score"] - new_pred["bboxes"][0][0]["score"]) < 1e-4
+
+
+Summary:
+Functions for testing the dumping, loading, and saving processes of different models (timm image, Hugging Face text, fusion model, and object detection) with specific datasets and predictors.
+
+Code Element Summaries:
+- Function `test_dump_timm_image`: A test function that validates the dumping and loading of a timm image model for MultiModalPredictor.
+- Function `test_dump_hf_text`: Tests the process of dumping a Hugging Face text model, loading it, and fitting a predictor with the loaded model.
+- Function `test_fusion_model_dump`: Tests the saving of a fusion model with specified hyperparameters and asserts the existence of directories for different model components.
+- Function `test_mmdet_object_detection_save_and_load`: Tests the saving and loading functionality of an object detection model using a specific dataset and predictor.
+
+
+=== File 10 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\multimodal\tests\unittests\others\test_semantic_segmentation.py
+File Name: test_semantic_segmentation.py
+
+Code:
+import os
+import shutil
+import uuid
+
+import numpy as np
+import numpy.testing as npt
+import pandas as pd
+import pytest
+import torch
+
+from autogluon.core.utils.loaders import load_zip
+from autogluon.multimodal import MultiModalPredictor
+
+
+# modify the load_sem_seg function in detectron2
+def file2id(folder_path, file_path, split_str="_"):
+    image_id = os.path.normpath(os.path.relpath(file_path, start=folder_path))
+    if split_str in image_id:
+        image_id = os.path.splitext(image_id)[0].split(split_str)[0]
+    else:
+        image_id = os.path.splitext(image_id)[0]
+    return image_id
+
+
+def get_file_paths(directory, split_str="_"):
+    file_paths = sorted(os.listdir(directory), key=lambda file_path: file2id(directory, file_path, split_str))
+    return [os.path.join(directory, file_path) for file_path in file_paths]
+
+
+def download_binary_semantic_seg_sample_dataset():
+    zip_file = "https://automl-mm-bench.s3.amazonaws.com/unit-tests/tiny_isic2017.zip"
+    download_dir = "./tiny_isic2017"
+
+    load_zip.unzip(zip_file, unzip_dir=download_dir)
+    data_dir = os.path.join(download_dir, "tiny_isic2017")
+
+    return data_dir
+
+
+def download_multi_semantic_seg_sample_dataset():
+    zip_file = "https://automl-mm-bench.s3.amazonaws.com/unit-tests/tiny_trans10kcls12.zip"
+    download_dir = "./tiny_trans10kcls12"
+
+    load_zip.unzip(zip_file, unzip_dir=download_dir)
+    data_dir = os.path.join(download_dir, "tiny_trans10kcls12")
+
+    return data_dir
+
+
+def get_file_df_binary_semantic_seg(need_test_gt=False):
+    data_dir = download_binary_semantic_seg_sample_dataset()
+    train_img_files = get_file_paths(os.path.join(data_dir, "train/ISIC-2017_Train"))
+    train_gt_files = get_file_paths(os.path.join(data_dir, "train/ISIC-2017_Training_Part1_GroundTruth"))
+    val_img_files = get_file_paths(os.path.join(data_dir, "val/ISIC-2017_Val"))
+    val_gt_files = get_file_paths(os.path.join(data_dir, "val/ISIC-2017_Validation_Part1_GroundTruth"))
+    test_img_files = get_file_paths(os.path.join(data_dir, "test/ISIC-2017_Test"))
+    test_gt_files = get_file_paths(os.path.join(data_dir, "test/ISIC-2017_Test_v2_Part1_GroundTruth"))
+
+    train_df = pd.DataFrame({"image": train_img_files, "label": train_gt_files})
+    val_df = pd.DataFrame({"image": val_img_files, "label": val_gt_files})
+    if need_test_gt:
+        test_df = pd.DataFrame({"image": test_img_files, "label": test_gt_files})
+    else:
+        test_df = pd.DataFrame({"image": test_img_files})
+    return train_df, val_df, test_df
+
+
+def get_file_df_multi_semantic_seg(need_test_gt=False):
+    data_dir = download_multi_semantic_seg_sample_dataset()
+    train_img_files = get_file_paths(os.path.join(data_dir, "train/images"))
+    train_gt_files = get_file_paths(os.path.join(data_dir, "train/masks_12"))
+    val_img_files = get_file_paths(os.path.join(data_dir, "validation/images"))
+    val_gt_files = get_file_paths(os.path.join(data_dir, "validation/masks_12"))
+    test_img_files = get_file_paths(os.path.join(data_dir, "test/images"))
+    test_gt_files = get_file_paths(os.path.join(data_dir, "test/masks_12"))
+
+    train_df = pd.DataFrame({"image": train_img_files, "label": train_gt_files})
+    val_df = pd.DataFrame({"image": val_img_files, "label": val_gt_files})
+    if need_test_gt:
+        test_df = pd.DataFrame({"image": test_img_files, "label": test_gt_files})
+    else:
+        test_df = pd.DataFrame({"image": test_img_files})
+    return train_df, val_df, test_df
+
+
+# TODO: Pytest does not support DDP
+@pytest.mark.single_gpu
+@pytest.mark.parametrize(
+    "checkpoint_name,efficient_finetune", [("facebook/sam-vit-base", "conv_lora"), ("facebook/sam-vit-base", "lora")]
+)
+def test_sam_semantic_segmentation_isic_fit_eval_predict_save_load(checkpoint_name, efficient_finetune):
+    # Binary semantic segmentation
+    train_df, val_df, test_df = get_file_df_binary_semantic_seg(need_test_gt=True)
+
+    validation_metric = "iou"
+    predictor = MultiModalPredictor(
+        problem_type="semantic_segmentation",
+        validation_metric=validation_metric,
+        eval_metric=validation_metric,
+        hyperparameters={
+            "model.sam.checkpoint_name": checkpoint_name,
+            "optimization.efficient_finetune": efficient_finetune,
+        },
+        label="label",
+        sample_data_path=train_df,
+    )
+
+    # Fit
+    predictor.fit(train_data=train_df, tuning_data=val_df, time_limit=20)
+
+    # Evaluation
+    predictor.evaluate(test_df, metrics=[validation_metric])
+
+    # Predict, save and load
+    verify_predictor_save_load_for_semantic_seg(predictor, test_df, as_multiclass=False)
+
+
+# TODO: Pytest does not support DDP
+@pytest.mark.single_gpu
+@pytest.mark.parametrize(
+    "checkpoint_name",
+    [
+        "facebook/sam-vit-base",
+    ],
+)
+def test_sam_semantic_segmentation_zero_shot_evaluate_predict(checkpoint_name):
+    _, _, test_df = get_file_df_binary_semantic_seg(need_test_gt=True)
+
+    validation_metric = "iou"
+    predictor = MultiModalPredictor(
+        problem_type="semantic_segmentation",
+        validation_metric=validation_metric,
+        eval_metric=validation_metric,
+        hyperparameters={
+            "model.sam.checkpoint_name": checkpoint_name,
+        },
+        label="label",
+        sample_data_path=test_df,
+    )
+
+    # Evaluate
+    predictor.evaluate(test_df, metrics=["iou"])
+
+    # Predict
+    predictor.predict(test_df, save_results=False)
+
+    # Predict without ground truth
+    _, _, test_df = get_file_df_binary_semantic_seg(need_test_gt=False)
+    predictor.predict(test_df, save_results=False)
+
+
+# TODO: Pytest does not support DDP
+@pytest.mark.single_gpu
+@pytest.mark.parametrize(
+    "checkpoint_name,efficient_finetune", [("facebook/sam-vit-base", "lora"), ("facebook/sam-vit-base", "conv_lora")]
+)
+def test_sam_semantic_segmentation_trans10k_fit_eval_predict_save_load(checkpoint_name, efficient_finetune):
+    # Multi-class semantic segmentation
+    train_df, val_df, test_df = get_file_df_multi_semantic_seg(need_test_gt=True)
+
+    validation_metric = "iou"
+    predictor = MultiModalPredictor(
+        problem_type="semantic_segmentation",
+        validation_metric=validation_metric,
+        eval_metric=validation_metric,
+        hyperparameters={
+            "env.precision": 32,
+            "model.sam.checkpoint_name": checkpoint_name,
+            "optimization.loss_function": "mask2former_loss",
+            "optimization.efficient_finetune": efficient_finetune,
+            "model.sam.num_mask_tokens": 10,
+        },
+        label="label",
+        sample_data_path=train_df,
+    )
+
+    # Fit
+    predictor.fit(train_data=train_df, tuning_data=val_df, time_limit=20)
+
+    # Evaluation
+    predictor.evaluate(test_df, metrics=[validation_metric])
+
+    # Predict, save and load
+    verify_predictor_save_load_for_semantic_seg(predictor, test_df, as_multiclass=True)
+
+
+def verify_predictor_save_load_for_semantic_seg(predictor, df, as_multiclass, cls=MultiModalPredictor):
+    root = str(uuid.uuid4())
+    os.makedirs(root, exist_ok=True)
+    predictor.save(root)
+    predictions = predictor.predict(df, as_pandas=False)
+    # Test fit_summary()
+    predictor.fit_summary()
+
+    loaded_predictor = cls.load(root)
+    # Test fit_summary()
+    loaded_predictor.fit_summary()
+
+    predictions2 = loaded_predictor.predict(df, as_pandas=False)
+    for prediction, prediction2 in zip(predictions, predictions2):
+        npt.assert_equal(prediction, prediction2)
+
+    predictions_prob = predictor.predict_proba(df, as_pandas=False, as_multiclass=as_multiclass)
+    predictions2_prob = loaded_predictor.predict_proba(df, as_pandas=False, as_multiclass=as_multiclass)
+    for prediction_prob, prediction2_prob in zip(predictions_prob, predictions2_prob):
+        npt.assert_equal(prediction_prob, prediction2_prob)
+
+    shutil.rmtree(root)
+
+
+# TODO: Pytest does not support DDP
+@pytest.mark.single_gpu
+@pytest.mark.parametrize(
+    "checkpoint_name",
+    [
+        "facebook/sam-vit-base",
+    ],
+)
+def test_sam_semantic_segmentation_get_class_num_func(checkpoint_name):
+    train_df, _, _ = get_file_df_multi_semantic_seg(need_test_gt=True)
+
+    validation_metric = "iou"
+    predictor = MultiModalPredictor(
+        problem_type="semantic_segmentation",
+        validation_metric=validation_metric,
+        eval_metric=validation_metric,
+        hyperparameters={
+            "env.precision": 32,
+            "model.sam.checkpoint_name": checkpoint_name,
+            "optimization.loss_function": "mask2former_loss",
+            "model.sam.num_mask_tokens": 10,
+        },
+        label="label",
+    )
+
+    get_class_num_func = predictor._learner.get_semantic_segmentation_class_num
+    num_classes = 11  # the true number of classes within the provided data
+
+    # pd.DataFrame as input
+    assert num_classes == get_class_num_func(train_df)
+    # file path as input
+    assert num_classes == get_class_num_func(train_df["label"][2])  # tiny_trans10kcls12/train/masks_12/2492_mask.png
+    # file directory path as input
+    assert num_classes == get_class_num_func(os.path.dirname(train_df["label"][0]))
+
+
+# TODO: Pytest does not support DDP
+@pytest.mark.single_gpu
+@pytest.mark.parametrize(
+    "frozen_layers",
+    [
+        ["prompt_encoder"],
+        ["vision_encoder"],
+    ],
+)
+def test_sam_semantic_segmentation_lora_insert(frozen_layers):
+    _, _, test_df = get_file_df_binary_semantic_seg(need_test_gt=True)
+    # SAM's vision encoder has query and value linear layers, while the prompt encoder does not.
+    predictor = MultiModalPredictor(
+        problem_type="semantic_segmentation",
+        hyperparameters={
+            "model.sam.checkpoint_name": "facebook/sam-vit-base",
+            "model.sam.frozen_layers": frozen_layers,
+        },
+        label="label",
+    )
+    # Evaluate
+    predictor.evaluate(test_df, metrics=["iou"])
+    model = predictor._learner._model
+    assert hasattr(model, "frozen_layers") and len(model.frozen_layers) > 0
+    for k, v in model.named_parameters():
+        for filter_layer in model.frozen_layers:
+            if filter_layer in k:
+                assert "lora" not in k
+
+
+# TODO: Pytest does not support DDP
+@pytest.mark.single_gpu
+@pytest.mark.parametrize(
+    "peft_method",
+    [
+        "bit_fit",
+        "norm_fit",
+    ],
+)
+def test_sam_semantic_segmentation_non_additive_peft_methods(peft_method):
+    # Binary semantic segmentation
+    train_df, val_df, test_df = get_file_df_binary_semantic_seg(need_test_gt=True)
+
+    validation_metric = "iou"
+    predictor = MultiModalPredictor(
+        problem_type="semantic_segmentation",
+        validation_metric=validation_metric,
+        eval_metric=validation_metric,
+        hyperparameters={
+            "model.sam.checkpoint_name": "facebook/sam-vit-base",
+            "optimization.efficient_finetune": peft_method,
+        },
+        label="label",
+        sample_data_path=train_df,
+    )
+
+    # Fit
+    predictor.fit(train_data=train_df, tuning_data=val_df, time_limit=20)
+
+    # Evaluation
+    predictor.evaluate(test_df, metrics=[validation_metric])
+
+    # Predict, save and load
+    verify_predictor_save_load_for_semantic_seg(predictor, test_df, as_multiclass=False)
+
+
+Summary:
+A collection of functions and test functions related to downloading, processing, training, and evaluating semantic segmentation models with SAM framework and various techniques.
+
+Code Element Summaries:
+- Function `file2id`: A function that extracts image IDs from file paths using a specified split string.
+- Function `get_file_paths`: Retrieves and returns sorted file paths within a directory using a specified split string for sorting.
+- Function `download_binary_semantic_seg_sample_dataset`: Downloads and returns the directory path for a sample dataset related to binary semantic segmentation.
+- Function `download_multi_semantic_seg_sample_dataset`: Downloads and extracts a zip file containing a small multi-semantic segmentation dataset.
+- Function `get_file_df_binary_semantic_seg`: Retrieves file paths for binary semantic segmentation dataset and creates dataframes for training, validation, and testing sets with image and label information.
+- Function `get_file_df_multi_semantic_seg`: Retrieves file paths for training, validation, and test datasets for multi-semantic segmentation tasks.
+- Function `test_sam_semantic_segmentation_isic_fit_eval_predict_save_load`: A test function for fitting, evaluating, predicting, saving, and loading a semantic segmentation model using SAM and efficient finetuning.
+- Function `test_sam_semantic_segmentation_zero_shot_evaluate_predict`: A function that evaluates and predicts semantic segmentation models using zero-shot learning with SAM (Semi-supervised Attention Mechanism).
+- Function `test_sam_semantic_segmentation_trans10k_fit_eval_predict_save_load`: A function that tests the fitting, evaluation, prediction, saving, and loading of a semantic segmentation model using the SAM framework with 10 mask tokens.
+- Function `verify_predictor_save_load_for_semantic_seg`: A function that tests the save and load functionality of a predictor for semantic segmentation tasks.
+- Function `test_sam_semantic_segmentation_get_class_num_func`: Tests the functionality of obtaining the number of classes in a semantic segmentation problem using different input types.
+- Function `test_sam_semantic_segmentation_lora_insert`: A test function for inserting frozen layers in a semantic segmentation model using SAM's vision encoder and prompt encoder.
+- Function `test_sam_semantic_segmentation_non_additive_peft_methods`: Tests the performance of different non-additive PEFT methods in semantic segmentation using SAM-ViT model.
+
+
+=== File 11 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\multimodal\src\autogluon\multimodal\data\template_engine.py
+File Name: template_engine.py
+
+Code:
+import logging
+
+import numpy as np
+from omegaconf import OmegaConf
+
+from autogluon.multimodal.data.templates import DatasetTemplates, Template, TemplateCollection
+
+from ..constants import AUTOMM
+
+logger = logging.getLogger(__name__)
+
+
+class TemplateEngine:
+    """
+    Class to manage the selection and use of templates.
+    """
+
+    def __init__(self, template_config: dict):
+        """
+        Initialize the TemplateEngine using preset templates from existing datasets or custom templates specified in config config.data.templates, if specified.
+
+        Parameters
+        ---------------
+        template_config
+            The templates configuration specified in config.data.templates.
+        """
+        self.templates = []
+        self.template_config = template_config
+        collection = TemplateCollection()
+        self.all_datasets = collection.keys
+        self.preset_templates = OmegaConf.select(self.template_config, "preset_templates", default=None)
+        self.custom_templates = OmegaConf.select(self.template_config, "custom_templates", default=None)
+        self.num_templates = OmegaConf.select(self.template_config, "num_templates", default=30)
+        self.template_length = OmegaConf.select(self.template_config, "template_length", default=2048)
+
+        if self.preset_templates:
+            assert (
+                len(self.preset_templates) == 2
+            ), f"Preset templates has the wrong format. Needs to be [DATASET, SUBSET]."
+            dataset_templates = DatasetTemplates(self.preset_templates[0], self.preset_templates[1])
+            current_templates = list(dataset_templates.templates.values())
+            self.templates += current_templates[: self.num_templates]
+
+        if self.custom_templates:
+            for key, value in self.custom_templates.items():
+                if len(self.templates) >= self.num_templates:
+                    logger.warning(
+                        f"Ignored custom template '{value.template}' as template engine already has {self.num_templates} templates."
+                    )
+                    break
+                template = Template(key, value.template, "custom", answer_choices=value.answer_choices)
+                self.templates.append(template)
+
+    def has_templates(self):
+        return len(self.templates) > 0
+
+    def get_templates(self):
+        return self.templates
+
+    def get_max_choice_length(self, tokenizer):
+        text = {}
+        max_length = 0
+        for template in self.templates:
+            answer_choices = template.get_answer_choices_list(text)
+            for choice in answer_choices:
+                answer_ids = tokenizer(
+                    choice,
+                )["input_ids"]
+                curr_length = len(answer_ids)
+                if curr_length > max_length:
+                    max_length = curr_length
+
+        return max_length
+
+    def sample_and_apply_template(self, example: dict):
+        """
+        Randomly sample a template from the collection of available templates and apply it to the sample.
+        If collection of templates is empty return original sample.
+
+        Parameters
+        ---------------
+        example
+            A data sample, i.e. a dictionary of text columns.
+
+        Returns
+        ------------------
+        A tuple consisting of the selected tuple and the sample after the template has been applied to it.
+        """
+        if not self.templates:
+            return [None, example]
+        template = np.random.choice(self.templates)
+        return [template, template.apply(example, truncation_length=self.template_length)]
+
+
+Summary:
+Class `TemplateEngine`: Manages the selection and application of templates to data samples, with functions for initialization, checking template presence, retrieval, determining max choice length, and sampling and applying templates.
+
+Code Element Summaries:
+- Class `TemplateEngine`: A class that manages the selection and application of templates to data samples.
+- Function `__init__`: Initializes the TemplateEngine with preset templates from existing datasets or custom templates specified in the configuration.
+- Function `has_templates`: Returns True if the number of templates associated with an object is greater than 0.
+- Function `get_templates`: A method that returns the templates associated with the object.
+- Function `get_max_choice_length`: Returns the maximum length of answer choices after tokenization using a given tokenizer.
+- Function `sample_and_apply_template`: Randomly selects and applies a template from a collection to a given data sample, returning the selected template and the modified sample.
+
+
+=== File 12 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\multimodal\src\autogluon\multimodal\models\fusion\__init__.py
+File Name: __init__.py
+
+Code:
+from .base import AbstractMultimodalFusionModel
+from .fusion_mlp import MultimodalFusionMLP
+from .fusion_ner import MultimodalFusionNER
+from .fusion_transformer import MultimodalFusionTransformer
+
+
+Summary:
+
+
+Code Element Summaries:
+
+
+=== File 13 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\multimodal\src\autogluon\multimodal\data\process_semantic_seg_img.py
+File Name: process_semantic_seg_img.py
+
+Code:
+import logging
+import random
+import warnings
+from io import BytesIO
+from typing import Dict, List, Optional, Union
+
+import numpy as np
+import PIL
+import torch
+from omegaconf import DictConfig
+from PIL import Image, ImageFile
+from torch import nn
+from torchvision import transforms
+
+from .utils import construct_image_processor, image_mean_std
+
+try:
+    from torchvision.transforms import InterpolationMode
+
+    BICUBIC = InterpolationMode.BICUBIC
+except ImportError:
+    BICUBIC = PIL.Image.BICUBIC
+
+from ..constants import (
+    CLASS_LABEL,
+    COLUMN,
+    IMAGE,
+    IMAGE_BYTEARRAY,
+    IMAGE_VALID_NUM,
+    LABEL,
+    MASK_LABEL,
+    SEMANTIC_SEGMENTATION_GT,
+    SEMANTIC_SEGMENTATION_IMG,
+)
+from .collator import ListCollator, PadCollator, StackCollator
+
+logger = logging.getLogger(__name__)
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+class SemanticSegImageProcessor:
+    """
+    Prepare image data for the model specified by "prefix". For multiple models requiring image data,
+    we need to create a ImageProcessor for each related model so that they will have independent input.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        img_transforms: List[str],
+        gt_transforms: List[str],
+        train_transforms: Optional[List[str]] = None,
+        val_transforms: Optional[List[str]] = None,
+        norm_type: Optional[str] = None,
+        max_img_num_per_col: Optional[int] = 1,
+        missing_value_strategy: Optional[str] = "skip",
+        requires_column_info: bool = False,
+        ignore_label: int = 255,
+    ):
+        """
+        Parameters
+        ----------
+        model
+            The model for which this processor would be created.
+        img_transforms
+            A list of image transforms for image.
+        gt_transforms
+            A list of image transforms for ground truth image.
+        train_transforms
+            A list of image transforms used in training for data augmentation. Note that the transform order matters.
+        val_transforms
+            A list of image transforms used in validation/test/prediction. Note that the transform order matters.
+        norm_type
+            How to normalize an image. We now support:
+            - inception
+                Normalize image by IMAGENET_INCEPTION_MEAN and IMAGENET_INCEPTION_STD from timm
+            - imagenet
+                Normalize image by IMAGENET_DEFAULT_MEAN and IMAGENET_DEFAULT_STD from timm
+            - clip
+                Normalize image by mean (0.48145466, 0.4578275, 0.40821073) and
+                std (0.26862954, 0.26130258, 0.27577711), used for CLIP.
+        max_img_num_per_col
+            The maximum number of images one sample can have.
+        missing_value_strategy
+            How to deal with a missing image. We now support:
+            - skip
+                Skip this sample
+        requires_column_info
+            Whether to require feature column information in dataloader.
+        ignore_label
+            Specifies a target value that is ignored and does not contribute to the training loss and metric calculation.
+        """
+
+        self.img_transforms, self.gt_transforms = img_transforms, gt_transforms
+
+        self.prefix = model.prefix
+        self.missing_value_strategy = missing_value_strategy
+        self.requires_column_info = requires_column_info
+
+        self.size = model.image_size
+        self.mean, self.std = image_mean_std(norm_type)
+        self.normalization = transforms.Normalize(self.mean, self.std)
+        self.num_classes = model.num_classes
+        self.ignore_label = ignore_label
+
+        self.max_img_num_per_col = max_img_num_per_col
+        if max_img_num_per_col <= 0:
+            logger.debug(f"max_img_num_per_col {max_img_num_per_col} is reset to 1")
+            max_img_num_per_col = 1
+        self.max_img_num_per_col = max_img_num_per_col
+        logger.debug(f"max_img_num_per_col: {max_img_num_per_col}")
+
+        self.img_processor = construct_image_processor(
+            image_transforms=self.img_transforms, size=self.size, normalization=self.normalization
+        )
+        self.gt_processor = construct_image_processor(
+            image_transforms=self.gt_transforms, size=self.size, normalization=None
+        )
+        self.train_transforms = self.get_train_transforms(train_transforms)
+
+    @property
+    def image_key(self):
+        return f"{self.prefix}_{IMAGE}"
+
+    @property
+    def label_key(self):
+        return f"{self.prefix}_{LABEL}"
+
+    @property
+    def image_valid_num_key(self):
+        return f"{self.prefix}_{IMAGE_VALID_NUM}"
+
+    @property
+    def image_column_prefix(self):
+        return f"{self.image_key}_{COLUMN}"
+
+    @property
+    def mask_label_key(self):
+        return f"{self.prefix}_{MASK_LABEL}"
+
+    @property
+    def class_label_key(self):
+        return f"{self.prefix}_{CLASS_LABEL}"
+
+    def collate_fn(self, image_column_names: Optional[List] = None, per_gpu_batch_size: Optional[int] = None) -> Dict:
+        """
+        Collate images into a batch. Here it pads images since the image number may
+        vary from sample to sample. Samples with less images will be padded zeros.
+        The valid image numbers of samples will be stacked into a vector.
+        This function will be used when creating Pytorch DataLoader.
+
+        Returns
+        -------
+        A dictionary containing one model's collator function for image data.
+        """
+        fn = {}
+        if self.requires_column_info:
+            return NotImplementedError(
+                f"requires_column_info={self.requires_column_info} not implemented for semantic segmentation tasks."
+            )
+        fn.update(
+            {
+                self.image_key: PadCollator(pad_val=0),
+                self.label_key: PadCollator(pad_val=0),
+            }
+        )
+
+        if self.num_classes > 1:
+            fn.update(
+                {
+                    self.mask_label_key: ListCollator(),
+                    self.class_label_key: ListCollator(),
+                }
+            )
+
+        return fn
+
+    def process_one_sample(
+        self,
+        image_features: Dict[str, Union[List[str], List[bytearray]]],
+        feature_modalities: Dict[str, List[str]],
+        is_training: bool,
+        image_mode: Optional[str] = "RGB",
+    ) -> Dict:
+        """
+        Read images, process them, and stack them for semantic segmentation.
+
+        Parameters
+        ----------
+        image_features
+            One sample may have multiple image columns in a pd.DataFrame and multiple images
+            inside each image column.
+        feature_modalities
+            What modality each column belongs to.
+        is_training
+            Whether to process images in the training mode.
+        image_mode
+            A string which defines the type and depth of a pixel in the image.
+            For example, RGB, RGBA, CMYK, and etc.
+
+        Returns
+        -------
+        A dictionary containing one sample's image, the valid number and the ground truth image label.
+        For multi-class semantic segmentation, the dictionary also includes information of per-category binary masks derived from the ground truth image. This logic follows the data processing of mask-based semantic segmentation.
+        """
+        images = []
+        gts = []
+        if self.num_classes > 1:
+            gt_masks_per_category = []
+            gt_classes = []
+
+        ret = {}
+        annotation_column = None
+        for column_name, column_modality in feature_modalities.items():
+            if column_modality == SEMANTIC_SEGMENTATION_IMG:
+                image_column = column_name
+            if column_modality == SEMANTIC_SEGMENTATION_GT:
+                annotation_column = column_name
+
+        per_col_image_features = image_features[image_column]
+        if is_training or annotation_column is not None:
+            per_col_gt_features = image_features[annotation_column]
+
+        for idx, img_feature in enumerate(per_col_image_features[: self.max_img_num_per_col]):
+            try:
+                with PIL.Image.open(img_feature) as img:
+                    img = img.convert(image_mode)
+            except Exception as e:
+                continue
+            if annotation_column:
+                gt_feature = per_col_gt_features[idx]
+
+                with PIL.Image.open(gt_feature) as gt:
+                    gt = gt.convert(gt.mode)
+                if self.num_classes == 1:
+                    gt = gt.convert("L")
+                if self.num_classes > 1:
+                    gt = np.array(
+                        gt
+                    ).astype(
+                        "float32"
+                    )  # There may be issues with 'transforms.ToTensor()' without this line because 'transforms.ToTensor()' converts 'unit8' to values between 0 and 1.
+                    gt = Image.fromarray(gt)
+            if is_training:
+                if random.random() < 0.5:
+                    img = self.train_transforms(img)
+                    gt = self.train_transforms(gt)
+                img = self.img_processor(img)
+                gt = self.gt_processor(gt)
+            else:
+                img = self.img_processor(img)
+                if annotation_column is not None:
+                    gt = self.gt_processor(gt)
+
+            images.append(img)
+            if is_training or annotation_column is not None:
+                gts.append(gt)
+
+                if self.num_classes > 1:
+                    # Prepare per-category binary masks
+                    per_gt_masks_per_category, per_gt_classes = self.prepare_per_category_binary_masks(gt)
+                    gt_masks_per_category.append(per_gt_masks_per_category)
+                    gt_classes.append(per_gt_classes)
+
+        ret.update(
+            {
+                self.image_key: images[0] if len(images) != 0 else torch.tensor([]),
+                self.label_key: gts[0] if len(gts) != 0 else torch.tensor([]),
+            }
+        )
+        if self.num_classes > 1:
+            ret.update(
+                {
+                    self.mask_label_key: gt_masks_per_category[0] if len(gt_masks_per_category) != 0 else [],
+                    self.class_label_key: gt_classes[0] if len(gt_classes) != 0 else [],
+                }
+            )
+        return ret
+
+    def prepare_per_category_binary_masks(self, gt):
+        gt = gt[0]
+        classes = torch.unique(gt)
+        # remove ignored region
+        gt_classes = classes[classes != self.ignore_label].to(torch.int64)
+
+        masks = []
+        for class_id in classes:
+            masks.append(gt == class_id)
+
+        if len(masks) == 0:
+            # Some image does not have annotation (all ignored)
+            gt_masks_per_category = torch.zeros((0, gt.shape[-2], gt.shape[-1]))
+        else:
+            gt_masks_per_category = torch.stack(masks)
+        return gt_masks_per_category, gt_classes
+
+    def __call__(
+        self,
+        images: Dict[str, List[str]],
+        feature_modalities: Dict[str, Union[int, float, list]],
+        is_training: bool,
+    ) -> Dict:
+        """
+        Obtain one sample's images and customized them for a specific model.
+
+        Parameters
+        ----------
+        images
+            Images of one sample.
+        feature_modalities
+            The modality of the feature columns.
+        is_training
+            Whether to process images in the training mode.
+
+        Returns
+        -------
+        A dictionary containing one sample's processed images and their number.
+        """
+        images = {k: [v] if isinstance(v, str) else v for k, v in images.items()}
+        return self.process_one_sample(images, feature_modalities, is_training)
+
+    def get_train_transforms(self, train_transforms):
+        train_trans = []
+        for trans_mode in train_transforms:
+            if trans_mode == "random_horizontal_flip":
+                train_trans.append(transforms.RandomHorizontalFlip(1.0))
+        return transforms.Compose(train_trans)
+
+
+Summary:
+Class `SemanticSegImageProcessor`: A processor class that prepares image data for a specified model by creating ImageProcessors for each related model, ensuring independent input processing with various functions for key formatting, collation, and transformation.
+
+Code Element Summaries:
+- Class `SemanticSegImageProcessor`: A class that prepares image data for a specified model by creating an ImageProcessor for each related model to ensure independent input.
+- Function `__init__`: Parameters - Initializes a processor with various parameters including model, image transforms, normalization type, and other configurations for data processing.
+- Function `image_key`: Returns a formatted string combining the prefix and the image constant.
+- Function `label_key`: Returns a concatenated string of prefix and label constant.
+- Function `image_valid_num_key`: Returns a string combining a prefix and a constant representing image validation number.
+- Function image_column_prefix: Returns a string combining the image key and a constant column value.
+- Function `mask_label_key`: Returns a concatenated string of prefix and MASK_LABEL.
+- Function `class_label_key`: Returns a string combining the prefix and class label.
+- Function `collate_fn`: A function that collates images into a batch by padding them with zeros and stacking valid image numbers into a vector, primarily used for creating Pytorch DataLoader.
+- Function `process_one_sample`: Reads and processes images for semantic segmentation, stacking them and returning a dictionary with image data and labels, including per-category binary masks for multi-class segmentation.
+- Function `prepare_per_category_binary_masks`: Generates binary masks for each category in ground truth annotations.
+- Function `__call__`: Processes one sample's images and customizes them for a specific model.
+- Function `get_train_transforms`: Returns a composition of training transformations based on specified modes.
+
+
+=== File 14 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\tabular\tests\unittests\dynamic_stacking\test_dynamic_stacking.py
+File Name: test_dynamic_stacking.py
+
+Code:
+import shutil
+
+import pytest
+
+from autogluon.core.constants import BINARY
+from autogluon.core.metrics import METRICS
+
+DS_ARGS_TEST_DEFAULTS = dict(
+    validation_procedure="holdout",
+    detection_time_frac=1 / 4,
+    holdout_frac=1 / 9,
+    n_folds=2,
+    n_repeats=1,
+    memory_safe_fits=True,
+    clean_up_fits=True,
+    holdout_data=None,
+)
+
+
+def test_spot_and_avoid_stacked_overfitting(fit_helper, dataset_loader_helper):
+    """Tests that dynamic stacking works."""
+    fit_args = dict(
+        hyperparameters={"RF": {}, "GBM": {}},
+        fit_weighted_ensemble=False,
+        dynamic_stacking=True,
+        num_stack_levels=1,
+        num_bag_folds=2,
+        num_bag_sets=1,
+        time_limit=None,
+        ds_args=DS_ARGS_TEST_DEFAULTS,
+        ag_args_ensemble={"fold_fitting_strategy": "sequential_local"},
+    )
+    dataset_name = "adult"
+    extra_metrics = list(METRICS[BINARY])
+
+    fit_helper.fit_and_validate_dataset(
+        dataset_name=dataset_name,
+        fit_args=fit_args,
+        extra_metrics=extra_metrics,
+        expected_model_count=2,
+        refit_full=False,
+        allowed_dataset_features=["age"],
+        expected_stacked_overfitting_at_test=False,
+        expected_stacked_overfitting_at_val=True,
+    )
+
+
+def test_dynamic_stacking_hps(fit_helper, dataset_loader_helper, stacked_overfitting_assert_func):
+    """Tests dynamic stacking arguments."""
+    fit_args = dict(
+        hyperparameters={"DUMMY": {}},
+        fit_weighted_ensemble=False,
+        dynamic_stacking=True,
+        num_stack_levels=1,
+        num_bag_folds=2,
+        num_bag_sets=1,
+        time_limit=None,
+        ag_args_ensemble={"fold_fitting_strategy": "sequential_local"},
+    )
+
+    # Get custom val data (the test data)
+    train_data, test_data, dataset_info = dataset_loader_helper.load_dataset(name="adult", directory_prefix="./datasets/")
+    label = dataset_info["label"]
+    allowed_cols = ["age", label]
+    train_data = train_data[allowed_cols]
+    test_data = test_data[allowed_cols]
+    n_test_data = len(test_data)
+
+    for ds_args_update in [
+        dict(validation_procedure="holdout", holdout_frac=1 / 5),  # holdout
+        dict(validation_procedure="cv"),  # 2-fold CV
+        dict(validation_procedure="cv", n_repeats=2),  # 2-repeated 2-fold CV
+        dict(memory_safe_fits=False, clean_up_fits=False),  # fit options False
+        dict(holdout_data=test_data),
+        dict(holdout_data=test_data, validation_procedure="cv", expect_raise=ValueError),
+    ]:
+        expect_raise = ds_args_update.pop("expect_raise", None)
+        tmp_ds_args = DS_ARGS_TEST_DEFAULTS.copy()
+        if ds_args_update is not None:
+            tmp_ds_args.update(ds_args_update)
+        tmp_fit_args = fit_args.copy()
+        tmp_fit_args["ds_args"] = tmp_ds_args
+        if expect_raise is None:
+            predictor = fit_helper.fit_dataset(train_data=train_data, init_args=dict(label=label), fit_args=tmp_fit_args, sample_size=1000)
+            if ("holdout_data" in ds_args_update) and (ds_args_update["holdout_data"] is not None):
+                n_expected = 1000 + n_test_data
+                assert len(predictor.predict_oof()) == n_expected, "Verify that holdout data was used for training"
+            lb = predictor.leaderboard(test_data, extra_info=True)
+            stacked_overfitting_assert_func(lb, predictor, False, False)
+            shutil.rmtree(predictor.path)
+        else:
+            with pytest.raises(expect_raise):
+                fit_helper.fit_dataset(train_data=train_data, init_args=dict(label=label), fit_args=tmp_fit_args, sample_size=1000)
+
+
+def test_no_dynamic_stacking(fit_helper):
+    """Tests that dynamic stacking does not run if stacking is disabled."""
+    fit_args = dict(
+        hyperparameters={"DUMMY": {}},
+        dynamic_stacking=True,
+        fit_weighted_ensemble=False,
+        num_stack_levels=0,
+        ag_args_ensemble={"fold_fitting_strategy": "sequential_local"},
+    )
+    dataset_name = "adult"
+    extra_metrics = list(METRICS[BINARY])
+
+    predictor = fit_helper.fit_and_validate_dataset(
+        dataset_name=dataset_name, fit_args=fit_args, extra_metrics=extra_metrics, expected_model_count=1, refit_full=False
+    )
+    assert predictor._stacked_overfitting_occurred is None
+
+
+def test_dynamic_stacking_fit_extra(fit_helper):
+    """Tests that fit_extra works after dynamic stacking."""
+    fit_args = dict(
+        hyperparameters={"RF": {}},
+        dynamic_stacking=True,
+        fit_weighted_ensemble=False,
+        num_bag_folds=2,
+        num_bag_sets=1,
+        num_stack_levels=1,
+        ds_args=DS_ARGS_TEST_DEFAULTS,
+        ag_args_ensemble={"fold_fitting_strategy": "sequential_local"},
+    )
+    dataset_name = "adult"
+    extra_metrics = list(METRICS[BINARY])
+
+    predictor = fit_helper.fit_and_validate_dataset(
+        dataset_name=dataset_name,
+        fit_args=fit_args,
+        extra_metrics=extra_metrics,
+        expected_model_count=1,
+        refit_full=False,
+        delete_directory=False,
+        allowed_dataset_features=["age"],
+        expected_stacked_overfitting_at_test=False,
+        # This also check that we only consider something to be stacked overfitting if the dynamic stacking holdout score gets worse.
+        expected_stacked_overfitting_at_val=True,
+    )
+
+    fit_extra_args = dict(
+        hyperparameters={"GBM": {}},
+        fit_weighted_ensemble=False,
+    )
+
+    predictor.fit_extra(**fit_extra_args)
+
+    assert len(predictor.model_names()) == 2
+    shutil.rmtree(predictor.path, ignore_errors=True)
+
+
+def test_dynamic_stacking_with_time_limit(fit_helper):
+    """Tests that dynamic stacking does not run if stacking is disabled."""
+    ds_args = DS_ARGS_TEST_DEFAULTS.copy()
+    ds_args["holdout_frac"] = 0.5
+    fit_args = dict(
+        hyperparameters={"DUMMY": {}},
+        dynamic_stacking=True,
+        fit_weighted_ensemble=False,
+        num_bag_folds=2,
+        num_bag_sets=1,
+        num_stack_levels=1,
+        time_limit=60,  # won't take 60s, but we need a number here instead of None.
+        ds_args=ds_args,
+        ag_args_ensemble={"fold_fitting_strategy": "sequential_local"},
+    )
+    dataset_name = "adult"
+    extra_metrics = list(METRICS[BINARY])
+
+    fit_helper.fit_and_validate_dataset(
+        dataset_name=dataset_name,
+        fit_args=fit_args,
+        extra_metrics=extra_metrics,
+        expected_model_count=2,
+        refit_full=False,
+        delete_directory=False,
+        allowed_dataset_features=["age"],
+        expected_stacked_overfitting_at_test=False,
+        expected_stacked_overfitting_at_val=False,
+    )
+
+
+@pytest.mark.timeout(120)  # if running AutoGluon twice fails due to a multiprocessing bug, we want to hang up and crash.
+def test_dynamic_stacking_run_twice_parallel_fold_fitting_strategy(fit_helper, dataset_loader_helper, stacked_overfitting_assert_func):
+    """Tests that dynamic stacking memory save fit works."""
+    ds_args = DS_ARGS_TEST_DEFAULTS.copy()
+    ds_args["memory_safe_fits"] = True  # guarantee for sanity
+    fit_args = dict(
+        hyperparameters={"DUMMY": {}},
+        fit_weighted_ensemble=False,
+        dynamic_stacking=True,
+        num_stack_levels=1,
+        num_bag_folds=2,
+        num_bag_sets=1,
+        time_limit=None,
+        ds_args=ds_args,
+    )
+
+    # Get custom val data (the test data)
+    train_data, test_data, dataset_info = dataset_loader_helper.load_dataset(name="adult", directory_prefix="./datasets/")
+    label = dataset_info["label"]
+    allowed_cols = ["age", label]
+    train_data = train_data[allowed_cols]
+    test_data = test_data[allowed_cols]
+
+    for _ in range(2):
+        predictor = fit_helper.fit_dataset(train_data=train_data, init_args=dict(label=label), fit_args=fit_args, sample_size=1000)
+        lb = predictor.leaderboard(test_data, extra_info=True)
+        stacked_overfitting_assert_func(lb, predictor, False, False)
+        shutil.rmtree(predictor.path)
+
+
+Summary:
+Functions testing dynamic stacking functionality and configurations, including spotting and avoiding overfitting, verifying stacking settings, validating post-stacking operations, and testing memory-saving fit with parallel fold fitting strategy.
+
+Code Element Summaries:
+- Function `test_spot_and_avoid_stacked_overfitting`: Tests the functionality of dynamic stacking to spot and avoid stacked overfitting.
+- Function `test_dynamic_stacking_hps`: Tests dynamic stacking arguments with various dataset and fitting configurations.
+- Function `test_no_dynamic_stacking`: Verifies that dynamic stacking is not executed when stacking is turned off.
+- Function `test_dynamic_stacking_fit_extra`: Validates that the fit_extra function operates successfully post dynamic stacking.
+- Function `test_dynamic_stacking_with_time_limit`: Verifies that dynamic stacking is not executed when stacking is turned off.
+- Function `test_dynamic_stacking_run_twice_parallel_fold_fitting_strategy`: Tests the functionality of dynamic stacking memory save fit with parallel fold fitting strategy.
+
+
+=== File 15 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\multimodal\tests\unittests\others_2\test_predictor_advanced.py
+File Name: test_predictor_advanced.py
+
+Code:
+import os
+import shutil
+
+import numpy.testing as npt
+import pytest
+from datasets import load_dataset
+
+from autogluon.multimodal import MultiModalPredictor
+from autogluon.multimodal.constants import BIT_FIT, IA3, IA3_BIAS, IA3_LORA, LORA_BIAS, LORA_NORM, NORM_FIT
+from autogluon.multimodal.models.timm_image import TimmAutoModelForImagePrediction
+from autogluon.multimodal.utils.misc import shopee_dataset
+
+from ..utils.unittest_datasets import AmazonReviewSentimentCrossLingualDataset
+
+
+@pytest.mark.single_gpu
+@pytest.mark.parametrize(
+    "backbone,efficient_finetuning,pooling_mode,precision,expected_ratio,standalone",
+    [
+        ("t5-small", LORA_NORM, "mean", "bf16-mixed", 0.00557, True),
+        ("google/flan-t5-small", IA3_LORA, "mean", "bf16-mixed", 0.006865, True),
+        ("google/flan-t5-small", IA3, "cls", "bf16-mixed", 0.0004201, False),
+        ("microsoft/deberta-v3-small", LORA_BIAS, "mean", "16-mixed", 0.001422, True),
+        ("microsoft/deberta-v3-small", IA3_BIAS, "cls", "16-mixed", 0.00044566, False),
+    ],
+)
+def test_predictor_gradient_checkpointing(
+    backbone, efficient_finetuning, pooling_mode, precision, expected_ratio, standalone
+):
+    dataset = AmazonReviewSentimentCrossLingualDataset()
+    train_data = dataset.train_df.sample(200)
+    test_data = dataset.test_df.sample(50)
+    save_path = f"gradient_checkpointing_{backbone}_{efficient_finetuning}_{pooling_mode}_{precision}"
+    if os.path.isdir(save_path):
+        shutil.rmtree(save_path)
+    predictor = MultiModalPredictor(label=dataset.label_columns[0], path=save_path)
+    predictor.fit(
+        train_data,
+        standalone=standalone,
+        hyperparameters={
+            "model.names": ["hf_text"],
+            "model.hf_text.checkpoint_name": backbone,
+            "model.hf_text.pooling_mode": pooling_mode,
+            "model.hf_text.gradient_checkpointing": True,
+            "optimization.efficient_finetune": efficient_finetuning,
+            "optimization.lr_decay": 1.0,
+            "optimization.learning_rate": 1e-03,
+            "optimization.max_epochs": 1,
+            "env.precision": precision,
+            "env.per_gpu_batch_size": 1,
+            "env.num_workers": 0,
+            "env.num_workers_evaluation": 0,
+            "env.num_gpus": -1,
+        },
+        time_limit=30,
+    )
+    predictions = predictor.predict(test_data, as_pandas=False)
+    tunable_ratio = predictor.trainable_parameters / predictor.total_parameters
+    npt.assert_allclose(tunable_ratio, expected_ratio, 2e-05, 2e-05)
+    save_path = save_path + "_new"
+    if os.path.isdir(save_path):
+        shutil.rmtree(save_path)
+    predictor.save(save_path, standalone=standalone)
+    new_predictor = MultiModalPredictor.load(save_path)
+    new_predictions = new_predictor.predict(test_data, as_pandas=False)
+    npt.assert_allclose(new_predictions, predictions)
+
+
+def test_predictor_skip_final_val():
+    download_dir = "./"
+    save_path = "petfinder_checkpoint"
+    train_df, tune_df = shopee_dataset(download_dir=download_dir)
+    if os.path.isdir(save_path):
+        shutil.rmtree(save_path)
+    predictor = MultiModalPredictor(label="label", path=save_path)
+    hyperparameters = {
+        "model.names": ["timm_image"],
+        "model.timm_image.checkpoint_name": "ghostnet_100",
+        "env.num_workers": 0,
+        "env.num_workers_evaluation": 0,
+        "optimization.top_k_average_method": "best",
+        "optimization.val_check_interval": 1.0,
+        "optimization.skip_final_val": True,
+    }
+    predictor.fit(
+        train_data=train_df,
+        tuning_data=tune_df,
+        hyperparameters=hyperparameters,
+        time_limit=5,
+    )
+    predictor_new = MultiModalPredictor.load(path=save_path)
+    assert isinstance(predictor_new._learner._model, TimmAutoModelForImagePrediction)
+
+
+def test_hyperparameters_in_terminal_format():
+    download_dir = "./"
+    train_df, tune_df = shopee_dataset(download_dir=download_dir)
+    predictor = MultiModalPredictor(label="label")
+    hyperparameters = [
+        "model.names=[timm_image]",
+        "model.timm_image.checkpoint_name=ghostnet_100",
+        "env.num_workers=0",
+        "env.num_workers_evaluation=0",
+        "optimization.top_k_average_method=best",
+        "optimization.val_check_interval=1.0",
+    ]
+    predictor.fit(
+        train_data=train_df,
+        tuning_data=tune_df,
+        hyperparameters=hyperparameters,
+        time_limit=2,
+    )
+
+
+@pytest.mark.parametrize("eval_metric", ["spearmanr", "pearsonr"])
+def test_predictor_with_spearman_pearson_eval(eval_metric):
+    train_df = load_dataset("SetFit/stsb", split="train").to_pandas()
+    predictor = MultiModalPredictor(label="label", eval_metric=eval_metric)
+    predictor.fit(train_df, presets="medium_quality", time_limit=5)
+    assert predictor.eval_metric == eval_metric
+
+
+@pytest.mark.parametrize("checkpoint_name", ["facebook/bart-base"])
+@pytest.mark.parametrize("efficient_finetune", [None, IA3_LORA])
+def test_predictor_with_bart(checkpoint_name, efficient_finetune):
+    train_data = load_dataset("glue", "mrpc")["train"].to_pandas().drop("idx", axis=1).sample(500)
+    test_data = load_dataset("glue", "mrpc")["validation"].to_pandas().drop("idx", axis=1).sample(20)
+    predictor = MultiModalPredictor(label="label")
+    predictor.fit(
+        train_data,
+        hyperparameters={
+            "model.hf_text.checkpoint_name": checkpoint_name,
+            "optimization.max_epochs": 1,
+            "optimization.efficient_finetune": efficient_finetune,
+            "optimization.top_k": 1,
+            "optimization.top_k_average_method": "best",
+            "env.batch_size": 2,
+        },
+        time_limit=20,
+    )
+    predictor.predict(test_data)
+
+
+Summary:
+Functions for testing various functionalities of a MultiModalPredictor, including gradient checkpointing, skip_final_val parameter, hyperparameters in terminal format, evaluation with correlation metrics, and BART model testing.
+
+Code Element Summaries:
+- Function `test_predictor_gradient_checkpointing`: A test function for evaluating the gradient checkpointing functionality of a MultiModalPredictor.
+- Function `test_predictor_skip_final_val`: A test function to evaluate the skip_final_val parameter in the MultiModalPredictor fitting process.
+- Function `test_hyperparameters_in_terminal_format`: A function that tests hyperparameters in terminal format using a MultiModalPredictor for image classification tasks.
+- Function `test_predictor_with_spearman_pearson_eval`: A test function that evaluates a predictor using Spearman and Pearson correlation metrics.
+- Function `test_predictor_with_bart`: A function that tests a predictor using BART model with specified hyperparameters and dataset samples.
+
+
+=== File 16 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\timeseries\src\autogluon\timeseries\models\ensemble\__init__.py
+File Name: __init__.py
+
+Code:
+from .abstract_timeseries_ensemble import AbstractTimeSeriesEnsembleModel
+from .greedy_ensemble import TimeSeriesGreedyEnsemble
+
+
+Summary:
+
+
+Code Element Summaries:
+
+
+=== File 17 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\tabular\src\autogluon\tabular\models\_utils\torch_utils.py
+File Name: torch_utils.py
+
+Code:
+import torch
+
+
+class TorchThreadManager:
+    """
+    Temporary updates torch num_threads to the specified value within the context, then reverts to the original num_threads upon exit.
+    """
+
+    def __init__(self, num_threads):
+        self.num_threads = num_threads
+        self.num_threads_og = None
+
+    def __enter__(self):
+        self.num_threads_og = torch.get_num_threads()
+        torch.set_num_threads(self.num_threads)
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        torch.set_num_threads(self.num_threads_og)
+
+
+Summary:
+Class TorchThreadManager: A context manager that temporarily adjusts the number of threads for torch operations and reverts to the original setting upon exiting the context.
+
+Code Element Summaries:
+- Class TorchThreadManager: Temporarily updates torch num_threads to a specified value within a context and reverts to the original num_threads upon exit.
+- Function `__init__`: Initializes the number of threads with an option to store the original number of threads.
+- Function `__enter__`: A method that sets the number of threads for torch operations to a specified value within a context manager.
+- Function `__exit__`: A method that resets the number of threads in Torch to its original value upon exiting a context.
+
+
+=== File 18 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\tabular\src\autogluon\tabular\models\tabular_nn\utils\data_preprocessor.py
+File Name: data_preprocessor.py
+
+Code:
+"""Data preprocessing helper functions for tabular neural network models"""
+
+from collections import OrderedDict
+
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import (  # can also consider: PowerTransformer
+    FunctionTransformer,
+    QuantileTransformer,
+    StandardScaler,
+)
+
+from .categorical_encoders import OneHotMergeRaresHandleUnknownEncoder, OrdinalMergeRaresHandleUnknownEncoder
+
+
+def create_preprocessor(
+    impute_strategy, max_category_levels, unique_category_str, continuous_features, skewed_features, onehot_features, embed_features, bool_features
+):
+    """Creates sklearn ColumnTransformer that can be fit to training data to preprocess it for tabular neural network."""
+    transformers = []  # order of various column transformers in this list is important!
+    if continuous_features:
+        continuous_transformer = Pipeline(steps=[("imputer", SimpleImputer(strategy=impute_strategy)), ("scaler", StandardScaler())])
+        transformers.append(("continuous", continuous_transformer, continuous_features))
+    if skewed_features:
+        power_transformer = Pipeline(
+            steps=[("imputer", SimpleImputer(strategy=impute_strategy)), ("quantile", QuantileTransformer(output_distribution="normal"))]
+        )  # Or output_distribution = 'uniform'
+        transformers.append(("skewed", power_transformer, skewed_features))
+    if onehot_features:
+        onehot_transformer = Pipeline(
+            steps=[("onehot", OneHotMergeRaresHandleUnknownEncoder(max_levels=max_category_levels, sparse=False))]
+        )  # test-time unknown values will be encoded as all zeros vector
+        transformers.append(("onehot", onehot_transformer, onehot_features))
+    if embed_features:  # Ordinal transformer applied to convert to-be-embedded categorical features to integer levels
+        ordinal_transformer = Pipeline(
+            steps=[("ordinal", OrdinalMergeRaresHandleUnknownEncoder(max_levels=max_category_levels))]
+        )  # returns 0-n when max_category_levels = n-1. category n is reserved for unknown test-time categories.
+        transformers.append(("ordinal", ordinal_transformer, embed_features))
+    return ColumnTransformer(
+        transformers=transformers, remainder="passthrough", force_int_remainder_cols=False,
+    )  # numeric features are processed in the same order as in numeric_features vector, so feature-names remain the same.
+
+
+def convert_df_dtype_to_str(df):
+    return df.astype(str)
+
+
+def get_feature_arraycol_map(processor, max_category_levels):
+    """Returns OrderedDict of feature-name -> list of column-indices in processed data array corresponding to this feature"""
+    feature_preserving_transforms = set(["continuous", "skewed", "ordinal", "bool", "remainder"])  # these transforms do not alter dimensionality of feature
+    feature_arraycol_map = {}  # unordered version
+    current_colindex = 0
+    for transformer in processor.transformers_:
+        transformer_name = transformer[0]
+        transformed_features = transformer[2]
+        if transformer_name in feature_preserving_transforms:
+            for feature in transformed_features:
+                if feature in feature_arraycol_map:
+                    raise ValueError("same feature is processed by two different column transformers: %s" % feature)
+                feature_arraycol_map[feature] = [current_colindex]
+                current_colindex += 1
+        elif transformer_name == "onehot":
+            oh_encoder = [step for (name, step) in transformer[1].steps if name == "onehot"][0]
+            for i in range(len(transformed_features)):
+                feature = transformed_features[i]
+                if feature in feature_arraycol_map:
+                    raise ValueError("same feature is processed by two different column transformers: %s" % feature)
+                oh_dimensionality = min(len(oh_encoder.categories_[i]), max_category_levels + 1)
+                feature_arraycol_map[feature] = list(range(current_colindex, current_colindex + oh_dimensionality))
+                current_colindex += oh_dimensionality
+        else:
+            raise ValueError("unknown transformer encountered: %s" % transformer_name)
+    return OrderedDict([(key, feature_arraycol_map[key]) for key in feature_arraycol_map])
+
+
+def get_feature_type_map(feature_arraycol_map, types_of_features):
+    """Returns OrderedDict of feature-name -> feature_type string (options: 'vector', 'embed')."""
+    if feature_arraycol_map is None:
+        raise ValueError("Must first call get_feature_arraycol_map() to set feature_arraycol_map before calling get_feature_type_map()")
+    vector_features = types_of_features["continuous"] + types_of_features["skewed"] + types_of_features["onehot"] + types_of_features["bool"]
+    feature_type_map = OrderedDict()
+    for feature_name in feature_arraycol_map:
+        if feature_name in vector_features:
+            feature_type_map[feature_name] = "vector"
+        elif feature_name in types_of_features["embed"]:
+            feature_type_map[feature_name] = "embed"
+        else:
+            feature_type_map[feature_name] = "vector"
+    return feature_type_map
+
+
+Summary:
+Functions `create_preprocessor`, `convert_df_dtype_to_str`, `get_feature_arraycol_map`, and `get_feature_type_map` facilitate data preprocessing and feature mapping for tabular neural networks.
+
+Code Element Summaries:
+- Function `create_preprocessor`: Generates a sklearn ColumnTransformer for preprocessing training data to be used in tabular neural networks.
+- Function `convert_df_dtype_to_str`: Converts all data types in a pandas DataFrame to string data type.
+- Function `get_feature_arraycol_map`: Returns an ordered dictionary mapping feature names to lists of column indices in a processed data array.
+- Function `get_feature_type_map`: Returns an OrderedDict mapping feature names to feature types ('vector' or 'embed') based on the input feature_arraycol_map and types_of_features.
+
+
+=== File 19 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\features\tests\test_check_style.py
+File Name: test_check_style.py
+
+Code:
+import logging
+import warnings
+from subprocess import PIPE, Popen
+
+
+def test_check_style():
+    logging.getLogger().setLevel(logging.INFO)
+    logging.info("PEP8 Style check")
+    flake8_proc = Popen(["flake8", "--count", "--max-line-length", "300"], stdout=PIPE)
+    flake8_out = flake8_proc.communicate()[0]
+    lines = flake8_out.splitlines()
+    count = int(lines[-1].decode())
+    if count > 0:
+        warnings.warn(f"{count} PEP8 warnings remaining")
+    assert count < 10, "Too many PEP8 warnings found, improve code quality to pass test."
+
+
+Summary:
+Function `test_check_style`: A function that detects PEP8 style violations in the code and raises a warning if a significant number are present.
+
+Code Element Summaries:
+- Function `test_check_style`: A function that checks for PEP8 style violations in the code and raises a warning if too many are found.
+
+
+=== File 20 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\autogluon-master\multimodal\src\autogluon\multimodal\data\dataset_mmlab\multi_image_mix_dataset.py
+File Name: multi_image_mix_dataset.py
+
+Code:
+import collections
+import copy
+import logging
+import math
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+import mmcv
+import numpy as np
+import pandas as pd
+import torch
+from mmcv.transforms import BaseTransform
+from mmcv.transforms.utils import cache_randomness
+from mmdet.structures.bbox import autocast_box_type
+from mmdet.utils import log_img_scale
+from mmengine.config import Config as MMConfig
+from mmengine.dataset import BaseDataset
+from numpy import random
+
+from ...constants import GET_ITEM_ERROR_RETRY, MULTI_IMAGE_MIX_DATASET, ROIS
+from ..preprocess_dataframe import MultiModalFeaturePreprocessor
+from ..utils import apply_data_processor, apply_df_preprocessor, get_per_sample_features
+
+logger = logging.getLogger(__name__)
+
+
+class MultiImageMixDataset(torch.utils.data.Dataset):
+    """
+    A Pytorch DataSet class to process a multimodal pd.DataFrame. It first uses a preprocessor to
+    produce model-agnostic features. Then, each processor prepares customized data for one modality
+    per model. For code simplicity, here we treat ground-truth label as one modality. This class is
+    independent of specific data modalities and models.
+    """
+
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        preprocessor: List[MultiModalFeaturePreprocessor],
+        processors: List[dict],
+        model_config: MMConfig,
+        id_mappings: Optional[Union[Dict[str, Dict], Dict[str, pd.Series]]] = None,
+        is_training: bool = False,
+    ):
+        """
+        Parameters
+        ----------
+        data
+            A pd.DataFrame containing multimodal features.
+        preprocessor
+            A list of multimodal feature preprocessors generating model-agnostic features.
+        processors
+            Data processors customizing data for each modality per model.
+        id_mappings
+            Id-to-content mappings. The contents can be text, image, etc.
+            This is used when the dataframe contains the query/response indexes instead of their contents.
+        is_training
+            Whether in training mode. Some data processing may be different between training
+            and validation/testing/prediction, e.g., image data augmentation is used only in
+            training.
+        model_config
+            Model config used to decided dataset type. e.g. if multi_image_mix_dataset is used in detection model,
+            MultiImageMixDataset will be used instead of BaseDataset
+        """
+        super().__init__()
+        self.processors = processors
+        self.is_training = is_training
+        self._consecutive_errors = 0
+
+        mix_config = model_config[MULTI_IMAGE_MIX_DATASET]
+        self.mix_data_key = "mmdet_image_image"  # the key of the data to mix, TODO: remove hardcoding
+        self.mix_result_key = "mix_results"  # the key of the mix result to store
+
+        self.mix_transforms = []
+        self.mix_transforms_types = []  # TODO: remove hardcode
+        if "mosaic" in mix_config:
+            self.mix_transforms.append(Mosaic(**mix_config["mosaic"]))
+            self.mix_transforms_types.append("mosaic")
+        if "mixup" in mix_config:
+            self.mix_transforms.append(MixUp(**mix_config["mixup"]))
+            self.mix_transforms_types.append("mixup")
+
+        self._skip_type_keys = None  # TODO: remove hardcode, we need to disable multi image mix in late epochs
+        self.max_refetch = 15  # TODO: remove hardcode (do we need refetch?)
+
+        self.lengths = []
+
+        for i, (per_preprocessor, per_processors_group) in enumerate(zip(preprocessor, processors)):
+            modality_features, modality_types, length = apply_df_preprocessor(
+                data=data,
+                df_preprocessor=per_preprocessor,
+                modalities=per_processors_group.keys(),
+            )
+            self.lengths.append(length)
+            setattr(self, f"modality_features_{i}", modality_features)
+            setattr(self, f"modality_types_{i}", modality_types)
+
+        assert len(set(self.lengths)) == 1
+
+        self.id_mappings = id_mappings
+
+    def __len__(self):
+        """
+        Assume that all modalities have the same sample number.
+
+        Returns
+        -------
+        Sample number in this dataset.
+        """
+        return self.lengths[0]
+
+    def _load_item(self, idx):
+        """
+        Get a single item without mix_results.
+        Iterate through all data processors to prepare model inputs. The data processors are
+        organized first by modalities and then by models.
+
+        Parameters
+        ----------
+        idx
+            Index of sample to process.
+
+        Returns
+        -------
+        Input data formatted as a dictionary.
+        """
+        ret = dict()
+        try:
+            for group_id, per_processors_group in enumerate(self.processors):
+                per_sample_features = get_per_sample_features(
+                    modality_features=getattr(self, f"modality_features_{group_id}"),
+                    modality_types=getattr(self, f"modality_types_{group_id}"),
+                    idx=idx,
+                    id_mappings=self.id_mappings,
+                )
+                per_ret = apply_data_processor(
+                    per_sample_features=per_sample_features,
+                    data_processors=per_processors_group,
+                    feature_modalities=getattr(self, f"modality_types_{group_id}"),
+                    is_training=self.is_training,
+                    load_only=True,
+                )
+                ret.update(per_ret)
+        except Exception as e:
+            logger.debug(f"Skipping sample {idx} due to '{e}'")
+            self._consecutive_errors += 1
+            if self._consecutive_errors < GET_ITEM_ERROR_RETRY:
+                return self.__getitem__((idx + 1) % self.__len__())
+            else:
+                raise e
+        self._consecutive_errors = 0
+
+        return ret
+
+    def __getitem__(self, idx):
+        """
+        Iterate through all data processors to prepare model inputs. The data processors are
+        organized first by modalities and then by models.
+
+        Parameters
+        ----------
+        idx
+            Index of sample to process.
+
+        Returns
+        -------
+        Input data formatted as a dictionary.
+        """
+        results = copy.deepcopy(self._load_item(idx))
+
+        for transform, transform_type in zip(self.mix_transforms, self.mix_transforms_types):
+            assert hasattr(transform, "get_indexes")
+
+            if self._skip_type_keys is not None and transform_type in self._skip_type_keys:
+                continue
+
+            for i in range(self.max_refetch):
+                # Make sure the results passed the loading pipeline
+                # of the original dataset is not None.
+                indexes = transform.get_indexes(self)
+                if not isinstance(indexes, collections.abc.Sequence):
+                    indexes = [indexes]
+                mix_results = [copy.deepcopy(self._load_item(index)[self.mix_data_key]) for index in indexes]
+                if None not in mix_results:
+                    results[self.mix_data_key][self.mix_result_key] = mix_results
+                    break
+            else:
+                raise RuntimeError(
+                    "The loading pipeline of the original dataset"
+                    " always return None. Please check the correctness "
+                    "of the dataset and its pipeline."
+                )
+
+            for i in range(self.max_refetch):
+                # To confirm the results passed the training pipeline
+                # of the wrapper is not None.
+                updated_results = transform(copy.deepcopy(results[self.mix_data_key]))
+                if updated_results is not None:
+                    results[self.mix_data_key] = updated_results
+                    break
+            else:
+                raise RuntimeError(
+                    "The training pipeline of the dataset wrapper"
+                    " always return None.Please check the correctness "
+                    "of the dataset and its pipeline."
+                )
+
+            if self.mix_result_key in results[self.mix_data_key]:
+                results[self.mix_data_key].pop(self.mix_result_key)
+
+        rois_processor = self.processors[0][ROIS][0]  # TODO: remove hardcode
+        results.update(
+            rois_processor.process_one_loaded_sample(
+                results,
+                is_training=True,  # This dataset is used only in training
+            )
+        )
+
+        return results
+
+
+class Mosaic(BaseTransform):
+    """Mosaic augmentation.
+
+    Given 4 images, mosaic transform combines them into
+    one output image. The output image is composed of the parts from each sub-
+    image.
+
+    .. code:: text
+
+                        mosaic transform
+                        center_x
+                +------------------------------+
+                |       pad        |  pad      |
+                |      +-----------+           |
+                |      |           |           |
+                |      |  image1   |--------+  |
+                |      |           |        |  |
+                |      |           | image2 |  |
+    center_y   |----+-------------+-----------|
+                |    |   cropped   |           |
+                |pad |   image3    |  image4   |
+                |    |             |           |
+                +----|-------------+-----------+
+                    |             |
+                    +-------------+
+
+    The mosaic transform steps are as follows:
+
+        1. Choose the mosaic center as the intersections of 4 images
+        2. Get the left top image according to the index, and randomly
+            sample another 3 images from the custom dataset.
+        3. Sub image will be cropped if image is larger than mosaic patch
+
+    Required Keys:
+
+    - img
+    - gt_bboxes (BaseBoxes[torch.float32]) (optional)
+    - gt_bboxes_labels (np.int64) (optional)
+    - gt_ignore_flags (bool) (optional)
+    - mix_results (List[dict])
+
+    Modified Keys:
+
+    - img
+    - img_shape
+    - gt_bboxes (optional)
+    - gt_bboxes_labels (optional)
+    - gt_ignore_flags (optional)
+
+    Args:
+        img_scale (Sequence[int]): Image size after mosaic pipeline of single
+            image. The shape order should be (width, height).
+            Defaults to (640, 640).
+        center_ratio_range (Sequence[float]): Center ratio range of mosaic
+            output. Defaults to (0.5, 1.5).
+        bbox_clip_border (bool, optional): Whether to clip the objects outside
+            the border of the image. In some dataset like MOT17, the gt bboxes
+            are allowed to cross the border of images. Therefore, we don't
+            need to clip the gt bboxes in these cases. Defaults to True.
+        pad_val (int): Pad value. Defaults to 114.
+        prob (float): Probability of applying this transformation.
+            Defaults to 1.0.
+    """
+
+    def __init__(
+        self,
+        img_scale: Tuple[int, int] = (640, 640),
+        center_ratio_range: Tuple[float, float] = (0.5, 1.5),
+        bbox_clip_border: bool = True,
+        pad_val: float = 114.0,
+        prob: float = 1.0,
+    ) -> None:
+        assert isinstance(img_scale, tuple)
+        assert 0 <= prob <= 1.0, "The probability should be in range [0,1]. " f"got {prob}."
+
+        log_img_scale(img_scale, skip_square=True, shape_order="wh")
+        self.img_scale = img_scale
+        self.center_ratio_range = center_ratio_range
+        self.bbox_clip_border = bbox_clip_border
+        self.pad_val = pad_val
+        self.prob = prob
+
+    @cache_randomness
+    def get_indexes(self, dataset: BaseDataset) -> int:
+        """Call function to collect indexes.
+
+        Args:
+            dataset (:obj:`MultiImageMixDataset`): The dataset.
+
+        Returns:
+            list: indexes.
+        """
+
+        indexes = [random.randint(0, len(dataset)) for _ in range(3)]
+        return indexes
+
+    @autocast_box_type()
+    def transform(self, results: dict) -> dict:
+        """Mosaic transform function.
+
+        Args:
+            results (dict): Result dict.
+
+        Returns:
+            dict: Updated result dict.
+        """
+        if random.uniform(0, 1) > self.prob:
+            return results
+
+        assert "mix_results" in results
+        mosaic_bboxes = []
+        mosaic_bboxes_labels = []
+        mosaic_ignore_flags = []
+        if len(results["img"].shape) == 3:
+            mosaic_img = np.full(
+                (int(self.img_scale[1] * 2), int(self.img_scale[0] * 2), 3),
+                self.pad_val,
+                dtype=results["img"].dtype,
+            )
+        else:
+            mosaic_img = np.full(
+                (int(self.img_scale[1] * 2), int(self.img_scale[0] * 2)), self.pad_val, dtype=results["img"].dtype
+            )
+
+        # mosaic center x, y
+        center_x = int(random.uniform(*self.center_ratio_range) * self.img_scale[0])
+        center_y = int(random.uniform(*self.center_ratio_range) * self.img_scale[1])
+        center_position = (center_x, center_y)
+
+        loc_strs = ("top_left", "top_right", "bottom_left", "bottom_right")
+        for i, loc in enumerate(loc_strs):
+            if loc == "top_left":
+                results_patch = copy.deepcopy(results)
+            else:
+                results_patch = copy.deepcopy(results["mix_results"][i - 1])
+
+            img_i = results_patch["img"]
+            h_i, w_i = img_i.shape[:2]
+            # keep_ratio resize
+            scale_ratio_i = min(self.img_scale[1] / h_i, self.img_scale[0] / w_i)
+            img_i = mmcv.imresize(img_i, (int(w_i * scale_ratio_i), int(h_i * scale_ratio_i)))
+
+            # compute the combine parameters
+            paste_coord, crop_coord = self._mosaic_combine(loc, center_position, img_i.shape[:2][::-1])
+            x1_p, y1_p, x2_p, y2_p = paste_coord
+            x1_c, y1_c, x2_c, y2_c = crop_coord
+
+            # crop and paste image
+            mosaic_img[y1_p:y2_p, x1_p:x2_p] = img_i[y1_c:y2_c, x1_c:x2_c]
+
+            # adjust coordinate
+            gt_bboxes_i = results_patch["gt_bboxes"]
+            gt_bboxes_labels_i = results_patch["gt_bboxes_labels"]
+            gt_ignore_flags_i = results_patch["gt_ignore_flags"]
+
+            padw = x1_p - x1_c
+            padh = y1_p - y1_c
+            gt_bboxes_i.rescale_([scale_ratio_i, scale_ratio_i])
+            gt_bboxes_i.translate_([padw, padh])
+            mosaic_bboxes.append(gt_bboxes_i)
+            mosaic_bboxes_labels.append(gt_bboxes_labels_i)
+            mosaic_ignore_flags.append(gt_ignore_flags_i)
+
+        mosaic_bboxes = mosaic_bboxes[0].cat(mosaic_bboxes, 0)
+        mosaic_bboxes_labels = np.concatenate(mosaic_bboxes_labels, 0)
+        mosaic_ignore_flags = np.concatenate(mosaic_ignore_flags, 0)
+
+        if self.bbox_clip_border:
+            mosaic_bboxes.clip_([2 * self.img_scale[1], 2 * self.img_scale[0]])
+        # remove outside bboxes
+        inside_inds = mosaic_bboxes.is_inside([2 * self.img_scale[1], 2 * self.img_scale[0]]).numpy()
+        mosaic_bboxes = mosaic_bboxes[inside_inds]
+        mosaic_bboxes_labels = mosaic_bboxes_labels[inside_inds]
+        mosaic_ignore_flags = mosaic_ignore_flags[inside_inds]
+
+        results["img"] = mosaic_img
+        results["img_shape"] = mosaic_img.shape[:2]
+        results["gt_bboxes"] = mosaic_bboxes
+        results["gt_bboxes_labels"] = mosaic_bboxes_labels
+        results["gt_ignore_flags"] = mosaic_ignore_flags
+        return results
+
+    def _mosaic_combine(
+        self, loc: str, center_position_xy: Sequence[float], img_shape_wh: Sequence[int]
+    ) -> Tuple[Tuple[int], Tuple[int]]:
+        """Calculate global coordinate of mosaic image and local coordinate of
+        cropped sub-image.
+
+        Args:
+            loc (str): Index for the sub-image, loc in ('top_left',
+            'top_right', 'bottom_left', 'bottom_right').
+            center_position_xy (Sequence[float]): Mixing center for 4 images,
+                (x, y).
+            img_shape_wh (Sequence[int]): Width and height of sub-image
+
+        Returns:
+            tuple[tuple[float]]: Corresponding coordinate of pasting and
+                cropping
+                - paste_coord (tuple): paste corner coordinate in mosaic image.
+                - crop_coord (tuple): crop corner coordinate in mosaic image.
+        """
+        assert loc in ("top_left", "top_right", "bottom_left", "bottom_right")
+        if loc == "top_left":
+            # index0 to top left part of image
+            x1, y1, x2, y2 = (
+                max(center_position_xy[0] - img_shape_wh[0], 0),
+                max(center_position_xy[1] - img_shape_wh[1], 0),
+                center_position_xy[0],
+                center_position_xy[1],
+            )
+            crop_coord = img_shape_wh[0] - (x2 - x1), img_shape_wh[1] - (y2 - y1), img_shape_wh[0], img_shape_wh[1]
+
+        elif loc == "top_right":
+            # index1 to top right part of image
+            x1, y1, x2, y2 = (
+                center_position_xy[0],
+                max(center_position_xy[1] - img_shape_wh[1], 0),
+                min(center_position_xy[0] + img_shape_wh[0], self.img_scale[0] * 2),
+                center_position_xy[1],
+            )
+            crop_coord = 0, img_shape_wh[1] - (y2 - y1), min(img_shape_wh[0], x2 - x1), img_shape_wh[1]
+
+        elif loc == "bottom_left":
+            # index2 to bottom left part of image
+            x1, y1, x2, y2 = (
+                max(center_position_xy[0] - img_shape_wh[0], 0),
+                center_position_xy[1],
+                center_position_xy[0],
+                min(self.img_scale[1] * 2, center_position_xy[1] + img_shape_wh[1]),
+            )
+            crop_coord = img_shape_wh[0] - (x2 - x1), 0, img_shape_wh[0], min(y2 - y1, img_shape_wh[1])
+
+        else:
+            # index3 to bottom right part of image
+            x1, y1, x2, y2 = (
+                center_position_xy[0],
+                center_position_xy[1],
+                min(center_position_xy[0] + img_shape_wh[0], self.img_scale[0] * 2),
+                min(self.img_scale[1] * 2, center_position_xy[1] + img_shape_wh[1]),
+            )
+            crop_coord = 0, 0, min(img_shape_wh[0], x2 - x1), min(y2 - y1, img_shape_wh[1])
+
+        paste_coord = x1, y1, x2, y2
+        return paste_coord, crop_coord
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f"(img_scale={self.img_scale}, "
+        repr_str += f"center_ratio_range={self.center_ratio_range}, "
+        repr_str += f"pad_val={self.pad_val}, "
+        repr_str += f"prob={self.prob})"
+        return repr_str
+
+
+class MixUp(BaseTransform):
+    """MixUp data augmentation.
+
+    .. code:: text
+
+                        mixup transform
+                +------------------------------+
+                | mixup image   |              |
+                |      +--------|--------+     |
+                |      |        |        |     |
+                |---------------+        |     |
+                |      |                 |     |
+                |      |      image      |     |
+                |      |                 |     |
+                |      |                 |     |
+                |      |-----------------+     |
+                |             pad              |
+                +------------------------------+
+
+    The mixup transform steps are as follows:
+
+        1. Another random image is picked by dataset and embedded in
+        the top left patch(after padding and resizing)
+        2. The target of mixup transform is the weighted average of mixup
+        image and origin image.
+
+    Required Keys:
+
+    - img
+    - gt_bboxes (BaseBoxes[torch.float32]) (optional)
+    - gt_bboxes_labels (np.int64) (optional)
+    - gt_ignore_flags (bool) (optional)
+    - mix_results (List[dict])
+
+
+    Modified Keys:
+
+    - img
+    - img_shape
+    - gt_bboxes (optional)
+    - gt_bboxes_labels (optional)
+    - gt_ignore_flags (optional)
+
+
+    Args:
+        img_scale (Sequence[int]): Image output size after mixup pipeline.
+            The shape order should be (width, height). Defaults to (640, 640).
+        ratio_range (Sequence[float]): Scale ratio of mixup image.
+            Defaults to (0.5, 1.5).
+        flip_ratio (float): Horizontal flip ratio of mixup image.
+            Defaults to 0.5.
+        pad_val (int): Pad value. Defaults to 114.
+        max_iters (int): The maximum number of iterations. If the number of
+            iterations is greater than `max_iters`, but gt_bbox is still
+            empty, then the iteration is terminated. Defaults to 15.
+        bbox_clip_border (bool, optional): Whether to clip the objects outside
+            the border of the image. In some dataset like MOT17, the gt bboxes
+            are allowed to cross the border of images. Therefore, we don't
+            need to clip the gt bboxes in these cases. Defaults to True.
+    """
+
+    def __init__(
+        self,
+        img_scale: Tuple[int, int] = (640, 640),
+        ratio_range: Tuple[float, float] = (0.5, 1.5),
+        flip_ratio: float = 0.5,
+        pad_val: float = 114.0,
+        max_iters: int = 15,
+        bbox_clip_border: bool = True,
+    ) -> None:
+        assert isinstance(img_scale, tuple)
+        log_img_scale(img_scale, skip_square=True, shape_order="wh")
+        self.dynamic_scale = img_scale
+        self.ratio_range = ratio_range
+        self.flip_ratio = flip_ratio
+        self.pad_val = pad_val
+        self.max_iters = max_iters
+        self.bbox_clip_border = bbox_clip_border
+
+    @cache_randomness
+    def get_indexes(self, dataset: BaseDataset) -> int:
+        """Call function to collect indexes.
+
+        Args:
+            dataset (:obj:`MultiImageMixDataset`): The dataset.
+
+        Returns:
+            list: indexes.
+        """
+
+        index = [np.random.randint(0, len(dataset)) for _ in range(1)]
+
+        return index
+
+    @autocast_box_type()
+    def transform(self, results: dict) -> dict:
+        """MixUp transform function.
+
+        Args:
+            results (dict): Result dict.
+
+        Returns:
+            dict: Updated result dict.
+        """
+
+        assert "mix_results" in results
+        assert len(results["mix_results"]) == 1, "MixUp only support 2 images now !"
+
+        if results["mix_results"][0]["gt_bboxes"].shape[0] == 0:
+            # empty bbox
+            return results
+
+        retrieve_results = results["mix_results"][0]
+        retrieve_img = retrieve_results["img"]
+
+        jit_factor = random.uniform(*self.ratio_range)
+        is_filp = random.uniform(0, 1) > self.flip_ratio
+
+        if len(retrieve_img.shape) == 3:
+            out_img = (
+                np.ones((self.dynamic_scale[1], self.dynamic_scale[0], 3), dtype=retrieve_img.dtype) * self.pad_val
+            )
+        else:
+            out_img = np.ones(self.dynamic_scale[::-1], dtype=retrieve_img.dtype) * self.pad_val
+
+        # 1. keep_ratio resize
+        scale_ratio = min(self.dynamic_scale[1] / retrieve_img.shape[0], self.dynamic_scale[0] / retrieve_img.shape[1])
+        retrieve_img = mmcv.imresize(
+            retrieve_img, (int(retrieve_img.shape[1] * scale_ratio), int(retrieve_img.shape[0] * scale_ratio))
+        )
+
+        # 2. paste
+        out_img[: retrieve_img.shape[0], : retrieve_img.shape[1]] = retrieve_img
+
+        # 3. scale jit
+        scale_ratio *= jit_factor
+        out_img = mmcv.imresize(out_img, (int(out_img.shape[1] * jit_factor), int(out_img.shape[0] * jit_factor)))
+
+        # 4. flip
+        if is_filp:
+            out_img = out_img[:, ::-1, :]
+
+        # 5. random crop
+        ori_img = results["img"]
+        origin_h, origin_w = out_img.shape[:2]
+        target_h, target_w = ori_img.shape[:2]
+        padded_img = np.ones((max(origin_h, target_h), max(origin_w, target_w), 3)) * self.pad_val
+        padded_img = padded_img.astype(np.uint8)
+        padded_img[:origin_h, :origin_w] = out_img
+
+        x_offset, y_offset = 0, 0
+        if padded_img.shape[0] > target_h:
+            y_offset = random.randint(0, padded_img.shape[0] - target_h)
+        if padded_img.shape[1] > target_w:
+            x_offset = random.randint(0, padded_img.shape[1] - target_w)
+        padded_cropped_img = padded_img[y_offset : y_offset + target_h, x_offset : x_offset + target_w]
+
+        # 6. adjust bbox
+        retrieve_gt_bboxes = retrieve_results["gt_bboxes"]
+        retrieve_gt_bboxes.rescale_([scale_ratio, scale_ratio])
+        if self.bbox_clip_border:
+            retrieve_gt_bboxes.clip_([origin_h, origin_w])
+
+        if is_filp:
+            retrieve_gt_bboxes.flip_([origin_h, origin_w], direction="horizontal")
+
+        # 7. filter
+        cp_retrieve_gt_bboxes = retrieve_gt_bboxes.clone()
+        cp_retrieve_gt_bboxes.translate_([-x_offset, -y_offset])
+        if self.bbox_clip_border:
+            cp_retrieve_gt_bboxes.clip_([target_h, target_w])
+
+        # 8. mix up
+        ori_img = ori_img.astype(np.float32)
+        mixup_img = 0.5 * ori_img + 0.5 * padded_cropped_img.astype(np.float32)
+
+        retrieve_gt_bboxes_labels = retrieve_results["gt_bboxes_labels"]
+        retrieve_gt_ignore_flags = retrieve_results["gt_ignore_flags"]
+
+        mixup_gt_bboxes = cp_retrieve_gt_bboxes.cat((results["gt_bboxes"], cp_retrieve_gt_bboxes), dim=0)
+        mixup_gt_bboxes_labels = np.concatenate((results["gt_bboxes_labels"], retrieve_gt_bboxes_labels), axis=0)
+        mixup_gt_ignore_flags = np.concatenate((results["gt_ignore_flags"], retrieve_gt_ignore_flags), axis=0)
+
+        # remove outside bbox
+        inside_inds = mixup_gt_bboxes.is_inside([target_h, target_w]).numpy()
+        mixup_gt_bboxes = mixup_gt_bboxes[inside_inds]
+        mixup_gt_bboxes_labels = mixup_gt_bboxes_labels[inside_inds]
+        mixup_gt_ignore_flags = mixup_gt_ignore_flags[inside_inds]
+
+        results["img"] = mixup_img.astype(np.uint8)
+        results["img_shape"] = mixup_img.shape[:2]
+        results["gt_bboxes"] = mixup_gt_bboxes
+        results["gt_bboxes_labels"] = mixup_gt_bboxes_labels
+        results["gt_ignore_flags"] = mixup_gt_ignore_flags
+
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f"(dynamic_scale={self.dynamic_scale}, "
+        repr_str += f"ratio_range={self.ratio_range}, "
+        repr_str += f"flip_ratio={self.flip_ratio}, "
+        repr_str += f"pad_val={self.pad_val}, "
+        repr_str += f"max_iters={self.max_iters}, "
+        repr_str += f"bbox_clip_border={self.bbox_clip_border})"
+        return repr_str
+
+
+class RandomAffine(BaseTransform):
+    """Random affine transform data augmentation.
+
+    This operation randomly generates affine transform matrix which including
+    rotation, translation, shear and scaling transforms.
+
+    Required Keys:
+
+    - img
+    - gt_bboxes (BaseBoxes[torch.float32]) (optional)
+    - gt_bboxes_labels (np.int64) (optional)
+    - gt_ignore_flags (bool) (optional)
+
+    Modified Keys:
+
+    - img
+    - img_shape
+    - gt_bboxes (optional)
+    - gt_bboxes_labels (optional)
+    - gt_ignore_flags (optional)
+
+    Args:
+        max_rotate_degree (float): Maximum degrees of rotation transform.
+            Defaults to 10.
+        max_translate_ratio (float): Maximum ratio of translation.
+            Defaults to 0.1.
+        scaling_ratio_range (tuple[float]): Min and max ratio of
+            scaling transform. Defaults to (0.5, 1.5).
+        max_shear_degree (float): Maximum degrees of shear
+            transform. Defaults to 2.
+        border (tuple[int]): Distance from width and height sides of input
+            image to adjust output shape. Only used in mosaic dataset.
+            Defaults to (0, 0).
+        border_val (tuple[int]): Border padding values of 3 channels.
+            Defaults to (114, 114, 114).
+        bbox_clip_border (bool, optional): Whether to clip the objects outside
+            the border of the image. In some dataset like MOT17, the gt bboxes
+            are allowed to cross the border of images. Therefore, we don't
+            need to clip the gt bboxes in these cases. Defaults to True.
+    """
+
+    def __init__(
+        self,
+        max_rotate_degree: float = 10.0,
+        max_translate_ratio: float = 0.1,
+        scaling_ratio_range: Tuple[float, float] = (0.5, 1.5),
+        max_shear_degree: float = 2.0,
+        border: Tuple[int, int] = (0, 0),
+        border_val: Tuple[int, int, int] = (114, 114, 114),
+        bbox_clip_border: bool = True,
+    ) -> None:
+        assert 0 <= max_translate_ratio <= 1
+        assert scaling_ratio_range[0] <= scaling_ratio_range[1]
+        assert scaling_ratio_range[0] > 0
+        self.max_rotate_degree = max_rotate_degree
+        self.max_translate_ratio = max_translate_ratio
+        self.scaling_ratio_range = scaling_ratio_range
+        self.max_shear_degree = max_shear_degree
+        self.border = border
+        self.border_val = border_val
+        self.bbox_clip_border = bbox_clip_border
+
+    @cache_randomness
+    def _get_random_homography_matrix(self, height, width):
+        # Rotation
+        rotation_degree = random.uniform(-self.max_rotate_degree, self.max_rotate_degree)
+        rotation_matrix = self._get_rotation_matrix(rotation_degree)
+
+        # Scaling
+        scaling_ratio = random.uniform(self.scaling_ratio_range[0], self.scaling_ratio_range[1])
+        scaling_matrix = self._get_scaling_matrix(scaling_ratio)
+
+        # Shear
+        x_degree = random.uniform(-self.max_shear_degree, self.max_shear_degree)
+        y_degree = random.uniform(-self.max_shear_degree, self.max_shear_degree)
+        shear_matrix = self._get_shear_matrix(x_degree, y_degree)
+
+        # Translation
+        trans_x = random.uniform(-self.max_translate_ratio, self.max_translate_ratio) * width
+        trans_y = random.uniform(-self.max_translate_ratio, self.max_translate_ratio) * height
+        translate_matrix = self._get_translation_matrix(trans_x, trans_y)
+
+        warp_matrix = translate_matrix @ shear_matrix @ rotation_matrix @ scaling_matrix
+        return warp_matrix
+
+    @autocast_box_type()
+    def transform(self, results: dict) -> dict:
+        import cv2  # TODO: support random affine requires cv2
+
+        img = results["img"]
+        height = img.shape[0] + self.border[1] * 2
+        width = img.shape[1] + self.border[0] * 2
+
+        warp_matrix = self._get_random_homography_matrix(height, width)
+
+        img = cv2.warpPerspective(img, warp_matrix, dsize=(width, height), borderValue=self.border_val)
+        results["img"] = img
+        results["img_shape"] = img.shape[:2]
+
+        bboxes = results["gt_bboxes"]
+        num_bboxes = len(bboxes)
+        if num_bboxes:
+            bboxes.project_(warp_matrix)
+            if self.bbox_clip_border:
+                bboxes.clip_([height, width])
+            # remove outside bbox
+            valid_index = bboxes.is_inside([height, width]).numpy()
+            results["gt_bboxes"] = bboxes[valid_index]
+            results["gt_bboxes_labels"] = results["gt_bboxes_labels"][valid_index]
+            results["gt_ignore_flags"] = results["gt_ignore_flags"][valid_index]
+
+            if "gt_masks" in results:
+                raise NotImplementedError("RandomAffine only supports bbox.")
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f"(max_rotate_degree={self.max_rotate_degree}, "
+        repr_str += f"max_translate_ratio={self.max_translate_ratio}, "
+        repr_str += f"scaling_ratio_range={self.scaling_ratio_range}, "
+        repr_str += f"max_shear_degree={self.max_shear_degree}, "
+        repr_str += f"border={self.border}, "
+        repr_str += f"border_val={self.border_val}, "
+        repr_str += f"bbox_clip_border={self.bbox_clip_border})"
+        return repr_str
+
+    @staticmethod
+    def _get_rotation_matrix(rotate_degrees: float) -> np.ndarray:
+        radian = math.radians(rotate_degrees)
+        rotation_matrix = np.array(
+            [[np.cos(radian), -np.sin(radian), 0.0], [np.sin(radian), np.cos(radian), 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        return rotation_matrix
+
+    @staticmethod
+    def _get_scaling_matrix(scale_ratio: float) -> np.ndarray:
+        scaling_matrix = np.array(
+            [[scale_ratio, 0.0, 0.0], [0.0, scale_ratio, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32
+        )
+        return scaling_matrix
+
+    @staticmethod
+    def _get_shear_matrix(x_shear_degrees: float, y_shear_degrees: float) -> np.ndarray:
+        x_radian = math.radians(x_shear_degrees)
+        y_radian = math.radians(y_shear_degrees)
+        shear_matrix = np.array(
+            [[1, np.tan(x_radian), 0.0], [np.tan(y_radian), 1, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32
+        )
+        return shear_matrix
+
+    @staticmethod
+    def _get_translation_matrix(x: float, y: float) -> np.ndarray:
+        translation_matrix = np.array([[1, 0.0, x], [0.0, 1, y], [0.0, 0.0, 1.0]], dtype=np.float32)
+        return translation_matrix
+
+
+Summary:
+Class `MultiImageMixDataset`: A PyTorch DataSet class for processing multimodal data with preprocessor and data processors per model, alongside classes `Mosaic`, `MixUp`, and `RandomAffine` for image augmentation and transformation.
+
+Code Element Summaries:
+- Class `MultiImageMixDataset`: A PyTorch DataSet class designed to process a multimodal pandas DataFrame by utilizing preprocessor and data processors for each modality per model, independent of specific data modalities and models.
+- Function `__init__`: Initializes the multimodal dataset with various parameters including data, preprocessors, processors, model configuration, id mappings, and training mode flags.
+- Function `__len__`: Returns the sample number in the dataset assuming all modalities have the same number of samples.
+- Function `_load_item`: Retrieves a single item without mixing results by iterating through data processors to prepare model inputs.
+- Function `__getitem__`: Iterates through data processors to prepare model inputs by applying transformations and checks for valid results.
+- Class `Mosaic`: A transformation class for applying mosaic augmentation to combine 4 images into one output image.
+- Function `__init__`: Initializes parameters for image scaling, center ratio range, bounding box clipping, padding value, and probability with assertions and logging.
+- Function `get_indexes`: Retrieves a list of random indexes from a dataset.
+- Function `transform`: A mosaic transform function that combines multiple images and bounding boxes into a single mosaic image with adjusted coordinates.
+- Function `_mosaic_combine`: Calculates global and local coordinates for pasting and cropping images in a mosaic layout.
+- Function `__repr__`: Returns a string representation of the class with specified attributes.
+- Class `MixUp`: A data augmentation class that implements mixup transform steps including image mixing, resizing, flipping, cropping, adjusting bounding boxes, and filtering.
+- Function `__init__`: Initializes object with default values for image scale, ratio range, flip ratio, padding value, maximum iterations, and bounding box clipping.
+- Function `get_indexes`: A method that collects random indexes from a dataset.
+- Function `transform`: A MixUp transform function that applies various image transformations and mixing operations to the input results dictionary.
+- Function `__repr__`: Returns a string representation of the class with its attributes.
+- Class `RandomAffine`: A data augmentation class that applies random affine transformations including rotation, translation, shear, and scaling.
+- Function `__init__`: Initializes parameters for data augmentation with constraints and default values.
+- Function `_get_random_homography_matrix`: Generates a random homography matrix combining rotation, scaling, shear, and translation transformations.
+- Function `transform`: Applies a random affine transformation to an image and its bounding boxes in the input dictionary.
+- Function `__repr__`: Generates a string representation of the object with its attributes.
+- Function `_get_rotation_matrix`: A function that calculates and returns a rotation matrix based on the input rotation angle in degrees.
+- Function `_get_scaling_matrix`: Returns a scaling matrix based on the given scale ratio in numpy array format.
+- Function `_get_shear_matrix`: Calculates and returns a shear matrix based on input shear angles in degrees.
+- Function `_get_translation_matrix`: Returns a translation matrix based on the provided x and y coordinates.
+

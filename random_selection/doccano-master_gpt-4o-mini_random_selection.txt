@@ -1,0 +1,872 @@
+=== File 1 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\projects\views\member.py
+File Name: member.py
+
+Code:
+from django.db import IntegrityError
+from django.shortcuts import get_object_or_404
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import generics, status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+
+from projects.exceptions import RoleAlreadyAssignedException, RoleConstraintException
+from projects.models import Member
+from projects.permissions import IsProjectAdmin, IsProjectMember
+from projects.serializers import MemberSerializer
+
+
+class MemberList(generics.ListCreateAPIView):
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["user"]
+    queryset = Member.objects.all()
+    serializer_class = MemberSerializer
+    pagination_class = None
+    permission_classes = [IsAuthenticated & IsProjectAdmin]
+
+    def filter_queryset(self, queryset):
+        queryset = queryset.filter(project=self.kwargs["project_id"])
+        return super().filter_queryset(queryset)
+
+    def perform_create(self, serializer):
+        try:
+            serializer.save(project_id=self.kwargs["project_id"])
+        except IntegrityError:
+            raise RoleAlreadyAssignedException
+
+    def delete(self, request, *args, **kwargs):
+        delete_ids = request.data["ids"]
+        project_id = self.kwargs["project_id"]
+        Member.objects.filter(project=project_id, pk__in=delete_ids).exclude(user=self.request.user).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class MemberDetail(generics.RetrieveUpdateAPIView):
+    queryset = Member.objects.all()
+    serializer_class = MemberSerializer
+    lookup_url_kwarg = "member_id"
+    permission_classes = [IsAuthenticated & IsProjectAdmin]
+
+    def perform_update(self, serializer):
+        project_id = self.kwargs["project_id"]
+        member_id = self.kwargs["member_id"]
+        role = serializer.validated_data["role"]
+        if not Member.objects.can_update(project_id, member_id, role.name):
+            raise RoleConstraintException
+        try:
+            super().perform_update(serializer)
+        except IntegrityError:
+            raise RoleAlreadyAssignedException
+
+
+class MyRole(generics.RetrieveAPIView):
+    queryset = Member.objects.all()
+    serializer_class = MemberSerializer
+    permission_classes = [IsAuthenticated & IsProjectMember]
+
+    def get_object(self):
+        kwargs = {"user": self.request.user, "project_id": self.kwargs["project_id"]}
+        return get_object_or_404(self.queryset, **kwargs)
+
+
+Summary:
+Class MemberList: A view for managing project members that includes authentication, permission checks, and methods for filtering, creating, and deleting members; Class MemberDetail: A view for retrieving and updating member details with role enforcement; Class MyRole: A view that retrieves a Member object for authenticated users within a project, ensuring proper access control.
+
+Code Element Summaries:
+- Class `MemberList`: A view that handles listing and creating members associated with a specific project, while enforcing authentication and project admin permissions, and includes methods for filtering and deleting members.
+- Function `filter_queryset`: A method that filters a given queryset to include only those items associated with a specific project ID before passing it to the superclass's filter method.
+- Function `perform_create`: Saves a serializer with a specified project ID and raises a RoleAlreadyAssignedException if an IntegrityError occurs.
+- Function `delete`: A method that removes specified members from a project while excluding the requesting user, returning a 204 No Content response.
+- Class MemberDetail: A view that handles retrieving and updating member details, enforcing role constraints and permissions for authenticated project administrators.
+- Function `perform_update`: Updates a member's role in a project while enforcing role constraints and handling potential integrity errors.
+- Class MyRole: A Django API view that retrieves a Member object for authenticated users who are members of a specific project.
+- Function `get_object`: Retrieves an object from the queryset based on the current user and project ID, returning a 404 error if not found.
+
+
+=== File 2 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\auto_labeling\urls.py
+File Name: urls.py
+
+Code:
+from django.urls import path
+
+from .views import (
+    AutomatedLabeling,
+    ConfigDetail,
+    ConfigList,
+    LabelExtractorTesting,
+    LabelMapperTesting,
+    RestAPIRequestTesting,
+    TemplateDetailAPI,
+    TemplateListAPI,
+)
+
+urlpatterns = [
+    path(route="auto-labeling/templates", view=TemplateListAPI.as_view(), name="auto_labeling_templates"),
+    path(
+        route="auto-labeling/templates/<str:option_name>",
+        view=TemplateDetailAPI.as_view(),
+        name="auto_labeling_template",
+    ),
+    path(route="auto-labeling/configs", view=ConfigList.as_view(), name="auto_labeling_configs"),
+    path(route="auto-labeling/configs/<int:config_id>", view=ConfigDetail.as_view(), name="auto_labeling_config"),
+    path(
+        route="auto-labeling/request-testing",
+        view=RestAPIRequestTesting.as_view(),
+        name="auto_labeling_parameter_testing",
+    ),
+    path(
+        route="auto-labeling/label-extractor-testing",
+        view=LabelExtractorTesting.as_view(),
+        name="auto_labeling_template_test",
+    ),
+    path(
+        route="auto-labeling/label-mapper-testing", view=LabelMapperTesting.as_view(), name="auto_labeling_mapping_test"
+    ),
+    path(route="auto-labeling", view=AutomatedLabeling.as_view(), name="auto_labeling"),
+]
+
+
+Summary:
+URL patterns for the automated labeling feature, mapping various views to specific routes for templates, configurations, and testing functionalities in a Django application.
+
+Code Element Summaries:
+
+
+=== File 3 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\projects\permissions.py
+File Name: permissions.py
+
+Code:
+from django.conf import settings
+from rest_framework.permissions import SAFE_METHODS, BasePermission
+
+from .models import Member
+
+
+class RolePermission(BasePermission):
+    UNSAFE_METHODS = ("POST", "PATCH", "DELETE")
+    unsafe_methods_check = True
+    role_name = ""
+
+    @classmethod
+    def get_project_id(cls, request, view):
+        return view.kwargs.get("project_id") or request.query_params.get("project_id")
+
+    def has_permission(self, request, view):
+        if request.user.is_superuser:
+            return True
+
+        if self.unsafe_methods_check and request.method in self.UNSAFE_METHODS:
+            return request.user.is_superuser
+
+        project_id = self.get_project_id(request, view)
+        if not project_id and request.method in SAFE_METHODS:
+            return True
+
+        return Member.objects.has_role(project_id, request.user, self.role_name)
+
+
+class IsProjectAdmin(RolePermission):
+    unsafe_methods_check = False
+    role_name = settings.ROLE_PROJECT_ADMIN
+
+
+class IsAnnotatorAndReadOnly(RolePermission):
+    role_name = settings.ROLE_ANNOTATOR
+
+
+class IsAnnotator(RolePermission):
+    unsafe_methods_check = False
+    role_name = settings.ROLE_ANNOTATOR
+
+
+class IsAnnotationApproverAndReadOnly(RolePermission):
+    role_name = settings.ROLE_ANNOTATION_APPROVER
+
+
+class IsAnnotationApprover(RolePermission):
+    unsafe_methods_check = False
+    role_name = settings.ROLE_ANNOTATION_APPROVER
+
+
+IsProjectMember = IsAnnotator | IsAnnotationApprover | IsProjectAdmin  # type: ignore
+IsProjectStaffAndReadOnly = IsAnnotatorAndReadOnly | IsAnnotationApproverAndReadOnly  # type: ignore
+
+
+Summary:
+Class RolePermission and its subclasses define various permission controls based on user roles and project IDs, with specific methods for retrieving project IDs and determining access permissions, including distinctions for superusers and different user roles such as project admins, annotators, and annotation approvers.
+
+Code Element Summaries:
+- Class `RolePermission`: A permission class that controls access based on user roles and project IDs, allowing superusers unrestricted access and validating permissions for unsafe methods.
+- Function `get_project_id`: Retrieves the project ID from the view's URL parameters or the request's query parameters.
+- Function `has_permission`: A method that determines if a user has permission to access a view based on their role, superuser status, and the request method.
+- Class IsProjectAdmin: A role permission class that defines the project admin role with unsafe methods check disabled.
+- Class IsAnnotatorAndReadOnly: A role permission class that defines the annotator role for read-only access.
+- Class IsAnnotator: A role permission class that defines the annotator role with unsafe methods check disabled.
+- Class IsAnnotationApproverAndReadOnly: A role permission class that defines the role of an annotation approver based on the specified role name in the settings.
+- Class IsAnnotationApprover: A role permission class that defines the permissions for users designated as annotation approvers, with unsafe methods check disabled.
+
+
+=== File 4 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\label_types\tests\utils.py
+File Name: utils.py
+
+Code:
+from model_mommy import mommy
+
+from projects.models import ProjectType
+
+
+def make_label(project, **kwargs):
+    if project.project_type.endswith("Classification") or project.project_type in {
+        ProjectType.BOUNDING_BOX,
+        ProjectType.SEGMENTATION,
+    }:
+        return mommy.make("CategoryType", project=project, **kwargs)
+    else:
+        return mommy.make("SpanType", project=project, **kwargs)
+
+
+Summary:
+Function `make_label`: A utility function that generates a CategoryType or SpanType instance depending on the project's classification, bounding box, or segmentation type.
+
+Code Element Summaries:
+- Function `make_label`: A utility function that creates either a CategoryType or SpanType instance based on the project's type for classification, bounding box, or segmentation projects.
+
+
+=== File 5 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\social\apps.py
+File Name: apps.py
+
+Code:
+from django.apps import AppConfig
+
+
+class SocialConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "social"
+
+
+Summary:
+Class SocialConfig: A Django application configuration class for the "social" app that sets the default auto field type for database models.
+
+Code Element Summaries:
+- Class SocialConfig: A Django application configuration class for the "social" app, specifying the default auto field type.
+
+
+=== File 6 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\api\migrations\0032_auto_20220127_0654.py
+File Name: 0032_auto_20220127_0654.py
+
+Code:
+# Generated by Django 3.2.11 on 2022-01-27 06:54
+
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ("api", "0031_auto_20220127_0032"),
+    ]
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.RemoveField(
+                    model_name="categorytype",
+                    name="project",
+                ),
+                migrations.AlterUniqueTogether(
+                    name="relationtypes",
+                    unique_together=None,
+                ),
+                migrations.RemoveField(
+                    model_name="relationtypes",
+                    name="project",
+                ),
+                migrations.RemoveField(
+                    model_name="spantype",
+                    name="project",
+                ),
+            ],
+            database_operations=[],
+        )
+    ]
+
+
+Summary:
+Class Migration: A Django migration that updates the database schema by removing fields and changing unique constraints for certain models within the 'api' app.
+
+Code Element Summaries:
+- Class Migration: A Django migration that modifies the database schema by removing fields and altering unique constraints for specific models in the 'api' app.
+
+
+=== File 7 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\users\tests\test_views.py
+File Name: test_views.py
+
+Code:
+from rest_framework import status
+from rest_framework.reverse import reverse
+from rest_framework.test import APITestCase
+
+from .utils import make_user
+
+
+class TestUserAPI(APITestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = make_user(username="bob")
+        cls.url = reverse(viewname="user_list")
+
+    def test_allows_authenticated_user_to_get_users(self):
+        self.client.force_login(self.user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["username"], self.user.username)
+
+    def test_denies_unauthenticated_user_to_get_users(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class TestMeAPI(APITestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = make_user(username="bob")
+        cls.url = reverse(viewname="me")
+
+    def test_return_own_information(self):
+        self.client.force_login(self.user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.data["id"], self.user.id)
+        self.assertEqual(response.data["username"], self.user.username)
+
+    def test_does_not_return_information_to_unauthenticated_user(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class TestUserCreationAPI(APITestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.staff = make_user(username="bob", is_staff=True)
+        cls.non_staff = make_user(username="tom", is_staff=False)
+        cls.url = reverse(viewname="user_create")
+        cls.payload = {"username": "hironsan", "password1": "foobarbaz", "password2": "foobarbaz"}
+
+    def test_staff_can_create_user(self):
+        self.client.force_login(self.staff)
+        response = self.client.post(self.url, data=self.payload)
+        self.assertEqual(response.data["username"], "hironsan")
+
+    def test_non_staff_cannot_create_user(self):
+        self.client.force_login(self.non_staff)
+        response = self.client.post(self.url, data=self.payload)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+Summary:
+Classes TestUserAPI, TestMeAPI, and TestUserCreationAPI: Test cases that validate user retrieval and creation functionalities in an API, ensuring proper access for authenticated users and restrictions for unauthenticated or non-staff users.
+
+Code Element Summaries:
+- Class TestUserAPI: A test case that verifies the user retrieval functionality, ensuring authenticated users can access user data while unauthenticated users are denied access.
+- Function `setUpTestData`: A class method that initializes test data by creating a user with the username "bob" and generating a URL for the user list view.
+- Function `test_allows_authenticated_user_to_get_users`: A test that verifies an authenticated user can successfully retrieve their own user information with a 200 OK status and correct username in the response.
+- Function `test_denies_unauthenticated_user_to_get_users`: A test that verifies an unauthenticated user receives a 403 Forbidden status when attempting to access the users endpoint.
+- Class TestMeAPI: A test case for the API that verifies user information retrieval for authenticated users and ensures access is forbidden for unauthenticated users.
+- Function `setUpTestData`: A class method that initializes test data by creating a user with the username "bob" and defining a URL for the view named "me".
+- Function `test_return_own_information`: A test case that verifies a logged-in user can retrieve their own ID and username from the API response.
+- Function `test_does_not_return_information_to_unauthenticated_user`: A test case that verifies an unauthenticated user receives a 403 Forbidden status when attempting to access a specific URL.
+- Class TestUserCreationAPI: A test case that verifies user creation functionality, ensuring that staff users can create new users while non-staff users are forbidden from doing so.
+- Function `setUpTestData`: A class method that initializes test data by creating a staff user, a non-staff user, and setting up a URL and payload for user creation.
+- Function `test_staff_can_create_user`: A test case that verifies a staff member can successfully create a user by checking the returned username in the response.
+- Function `test_non_staff_cannot_create_user`: A test case that verifies non-staff users are forbidden from creating a new user, expecting a 403 Forbidden response.
+
+
+=== File 8 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\data_export\migrations\0002_exportedboundingbox.py
+File Name: 0002_exportedboundingbox.py
+
+Code:
+# Generated by Django 4.0.4 on 2022-06-30 02:44
+
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ("labels", "0015_create_boundingbox_table"),
+        ("data_export", "0001_initial"),
+    ]
+
+    operations = [
+        migrations.CreateModel(
+            name="ExportedBoundingBox",
+            fields=[],
+            options={
+                "proxy": True,
+                "indexes": [],
+                "constraints": [],
+            },
+            bases=("labels.boundingbox",),
+        ),
+    ]
+
+
+Summary:
+Class Migration: A Django migration that establishes a proxy model `ExportedBoundingBox` derived from the existing `BoundingBox` model without introducing any new fields or constraints.
+
+Code Element Summaries:
+- Class Migration: A Django migration that creates a proxy model `ExportedBoundingBox` based on the existing `BoundingBox` model with no additional fields or constraints.
+
+
+=== File 9 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\data_export\tests\test_dataset.py
+File Name: test_dataset.py
+
+Code:
+import unittest
+from unittest.mock import MagicMock
+
+import pandas as pd
+from pandas.testing import assert_frame_equal
+
+from data_export.pipeline.dataset import Dataset
+
+
+class TestDataset(unittest.TestCase):
+    def setUp(self):
+        example = MagicMock()
+        example.to_dict.return_value = {"data": "example"}
+        self.examples = MagicMock()
+        self.examples.__iter__.return_value = [example]
+        label = MagicMock()
+        label.find_by.return_value = {"labels": ["label"]}
+        self.labels = MagicMock()
+        self.labels.__iter__.return_value = [label]
+        comment = MagicMock()
+        comment.find_by.return_value = {"comments": ["comment"]}
+        self.comments = MagicMock()
+        self.comments.__iter__.return_value = [comment]
+
+    def test_to_dataframe(self):
+        dataset = Dataset(self.examples, self.labels, self.comments)
+        df = dataset.to_dataframe()
+        expected = pd.DataFrame([{"data": "example", "labels": ["label"], "comments": ["comment"]}])
+        assert_frame_equal(df, expected)
+
+
+Summary:
+Class `TestDataset`: A unit test case that validates the `Dataset` class's conversion to a DataFrame by using mocked examples, labels, and comments, with a setup method to initialize these mocks and a test function to ensure accurate conversion.
+
+Code Element Summaries:
+- Class `TestDataset`: A unit test case that verifies the functionality of the `Dataset` class by checking its conversion to a DataFrame using mocked examples, labels, and comments.
+- Function `setUp`: A setup method that initializes mock objects for examples, labels, and comments, each configured to return specific data when called.
+- Function `test_to_dataframe`: A test function that verifies the correct conversion of a Dataset object into a pandas DataFrame format.
+
+
+=== File 10 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\roles\migrations\__init__.py
+File Name: __init__.py
+
+Code:
+
+
+Summary:
+
+
+Code Element Summaries:
+
+
+=== File 11 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\metrics\migrations\__init__.py
+File Name: __init__.py
+
+Code:
+
+
+Summary:
+
+
+Code Element Summaries:
+
+
+=== File 12 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\api\migrations\0028_auto_20220111_0655.py
+File Name: 0028_auto_20220111_0655.py
+
+Code:
+# Generated by Django 3.2.8 on 2022-01-11 06:55
+
+from django.db import migrations
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ("api", "0027_auto_20211222_0454"),
+    ]
+
+    operations = [
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.AlterUniqueTogether(
+                    name="rolemapping",
+                    unique_together=None,
+                ),
+                migrations.RemoveField(
+                    model_name="rolemapping",
+                    name="project",
+                ),
+                migrations.RemoveField(
+                    model_name="rolemapping",
+                    name="role",
+                ),
+                migrations.RemoveField(
+                    model_name="rolemapping",
+                    name="user",
+                ),
+            ],
+            database_operations=[],
+        ),
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.DeleteModel(
+                    name="Role",
+                ),
+                migrations.DeleteModel(
+                    name="RoleMapping",
+                ),
+            ],
+            database_operations=[
+                migrations.AlterModelTable(name="Role", table="roles_role"),
+                migrations.AlterModelTable(name="RoleMapping", table="roles_rolemapping"),
+            ],
+        ),
+    ]
+
+
+Summary:
+Class Migration: A Django migration that updates the database schema by removing role management fields and models while renaming the remaining model tables.
+
+Code Element Summaries:
+- Class `Migration`: A Django migration that alters the database schema by removing fields and models related to role management and modifies the table names for the remaining models.
+
+
+=== File 13 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\labels\admin.py
+File Name: admin.py
+
+Code:
+from django.contrib import admin
+
+from .models import BoundingBox, Category, Segmentation, Span, TextLabel
+
+
+class SpanAdmin(admin.ModelAdmin):
+    list_display = ("example", "label", "start_offset", "user")
+    ordering = ("example",)
+
+
+class CategoryAdmin(admin.ModelAdmin):
+    list_display = ("example", "label", "user")
+    ordering = ("example",)
+
+
+class TextLabelAdmin(admin.ModelAdmin):
+    list_display = ("example", "text", "user")
+    ordering = ("example",)
+
+
+class BoundingBoxAdmin(admin.ModelAdmin):
+    list_display = ("example", "label", "user", "x", "y", "width", "height")
+    ordering = ("example",)
+
+
+class SegmentationAdmin(admin.ModelAdmin):
+    list_display = ("example", "label", "user", "points")
+    ordering = ("example",)
+
+
+admin.site.register(Category, CategoryAdmin)
+admin.site.register(Span, SpanAdmin)
+admin.site.register(TextLabel, TextLabelAdmin)
+admin.site.register(BoundingBox, BoundingBoxAdmin)
+admin.site.register(Segmentation, SegmentationAdmin)
+
+
+Summary:
+Classes SpanAdmin, CategoryAdmin, TextLabelAdmin, BoundingBoxAdmin, and SegmentationAdmin: Django admin model configurations that customize the display fields and ordering for their respective objects in the admin interface.
+
+Code Element Summaries:
+- Class SpanAdmin: A Django admin model configuration that specifies the display fields and ordering for Span objects in the admin interface.
+- Class CategoryAdmin: A Django admin model that customizes the display and ordering of category objects in the admin interface.
+- Class `TextLabelAdmin`: A Django admin model that manages the display and ordering of text label entries in the admin interface.
+- Class BoundingBoxAdmin: A Django admin model that customizes the display and ordering of bounding box annotations in the admin interface.
+- Class SegmentationAdmin: A Django admin model that manages the display and ordering of segmentation annotations in the admin interface.
+
+
+=== File 14 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\data_import\pipeline\examples.py
+File Name: examples.py
+
+Code:
+from typing import Dict, List
+
+from pydantic import UUID4
+
+from examples.models import Example
+
+
+class Examples:
+    def __init__(self, examples: List[Example]):
+        self.examples = examples
+        self.uuid_to_example: Dict[UUID4, Example] = {}
+
+    def __getitem__(self, uuid: UUID4) -> Example:
+        return self.uuid_to_example[uuid]
+
+    def __contains__(self, uuid: UUID4) -> bool:
+        return uuid in self.uuid_to_example
+
+    def save(self):
+        examples = Example.objects.bulk_create(self.examples)
+        self.uuid_to_example = {example.uuid: example for example in examples}
+
+
+Summary:
+Class Examples: A container for managing Example objects that offers methods for retrieval, membership checking, and bulk saving, while initializing with a list of examples and mapping their UUIDs for efficient access.
+
+Code Element Summaries:
+- Class Examples: A container for managing a list of Example objects, providing methods for item retrieval, membership checking, and bulk saving to a database.
+- Function `__init__`: Initializes an instance with a list of examples and creates a dictionary to map UUIDs to examples.
+- Function `__getitem__`: Retrieves an `Example` object from the `uuid_to_example` mapping using a given UUID.
+- Function `__contains__`: Checks if a given UUID is present in the `uuid_to_example` mapping.
+- Function `save`: This method creates multiple Example instances in bulk and maps their UUIDs to the corresponding examples in a dictionary.
+
+
+=== File 15 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\data_export\pipeline\__init__.py
+File Name: __init__.py
+
+Code:
+
+
+Summary:
+
+
+Code Element Summaries:
+
+
+=== File 16 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\projects\management\commands\create_member.py
+File Name: create_member.py
+
+Code:
+from django.contrib.auth.models import User
+from django.core.management.base import BaseCommand, CommandError
+from models import Project
+
+from ...models import Member
+from roles.models import Role
+
+
+class Command(BaseCommand):
+    help = "Non-interactively create a member"
+
+    @classmethod
+    def add_arguments(self, parser):
+        parser.add_argument("--rolename", default=None, help="The name of the role.")
+        parser.add_argument("--username", default=None, help="The name of the user.")
+        parser.add_argument("--projectname", default=None, help="The name of the project.")
+
+    def handle(self, *args, **options):
+        rolename = options.get("rolename")
+        username = options.get("username")
+        projectname = options.get("projectname")
+
+        if not rolename or not username or not projectname:
+            raise CommandError("--rolename  --projectname  --username are required for the member")
+
+        if rolename and projectname and username:
+            try:
+                role = Role.objects.get(name=rolename)
+                user = User.objects.get(username=username)
+                project = Project.objects.get(name=projectname)
+                member = Member.objects.create(role_id=role.id, user_id=user.id, project_id=project.id)
+            except Exception as ex:
+                self.stderr.write(self.style.ERROR('Error occurred while creating member "%s"' % ex))
+            else:
+                self.stdout.write(self.style.SUCCESS('Member created successfully "%s"' % member.id))
+
+
+Summary:
+Class Command: A management command that facilitates the non-interactive creation of a member by accepting role name, username, and project name as arguments, while managing potential errors and providing feedback.
+
+Code Element Summaries:
+- Class Command: A management command that non-interactively creates a member by requiring a role name, username, and project name, and handles potential errors during the process.
+- Function `add_arguments`: A method that adds command-line argument options for role name, user name, and project name to a parser.
+- Function `handle`: A method that processes command options to create a new member associated with a specified role, user, and project, while handling errors and providing success or error messages.
+
+
+=== File 17 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\data_export\tests\test_models.py
+File Name: test_models.py
+
+Code:
+from django.test import TestCase
+from model_mommy import mommy
+
+from data_export.models import ExportedExample
+from projects.tests.utils import prepare_project
+
+
+class TestExportedExample(TestCase):
+    def prepare_data(self, collaborative=False):
+        self.project = prepare_project(collaborative_annotation=collaborative)
+        self.example1 = mommy.make("ExportedExample", project=self.project.item)
+        self.example2 = mommy.make("ExportedExample", project=self.project.item)
+        mommy.make("ExampleState", example=self.example1, confirmed_by=self.project.admin)
+
+    def test_collaborative(self):
+        self.prepare_data(collaborative=True)
+        examples = ExportedExample.objects.confirmed(self.project.item)
+        self.assertEqual(examples.count(), 1)
+        self.assertEqual(examples.first(), self.example1)
+
+    def test_filter_by_confirmed_user(self):
+        self.prepare_data(collaborative=False)
+        examples = ExportedExample.objects.confirmed(self.project.item, user=self.project.admin)
+        self.assertEqual(examples.count(), 1)
+        self.assertEqual(examples.first(), self.example1)
+
+    def test_filter_by_unconfirmed_user(self):
+        self.prepare_data(collaborative=False)
+        examples = ExportedExample.objects.confirmed(self.project.item, user=self.project.annotator)
+        self.assertEqual(examples.count(), 0)
+
+
+Summary:
+Class TestExportedExample: A test suite designed to validate the functionality of confirmed `ExportedExample` instances in collaborative settings, including data preparation and user-specific filtering of confirmed examples.
+
+Code Element Summaries:
+- Class TestExportedExample: A test case for verifying the behavior of confirmed `ExportedExample` instances based on collaborative settings and user filters.
+- Function `prepare_data`: Prepares project data by creating instances of `ExportedExample` and `ExampleState` based on the collaborative annotation setting.
+- Function `test_collaborative`: A test function that verifies the correct preparation and confirmation of collaborative examples in a project, ensuring that only one confirmed example exists and it matches a predefined example.
+- Function `test_filter_by_confirmed_user`: A test that verifies the filtering of confirmed examples by a specific user in a collaborative project, ensuring that only the expected example is returned.
+- Function `test_filter_by_unconfirmed_user`: A test case that verifies that no confirmed examples are returned for an unconfirmed user in the specified project.
+
+
+=== File 18 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\labels\tests\__init__.py
+File Name: __init__.py
+
+Code:
+
+
+Summary:
+
+
+Code Element Summaries:
+
+
+=== File 19 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\api\migrations\0014_auto_20210603_0438.py
+File Name: 0014_auto_20210603_0438.py
+
+Code:
+# Generated by Django 3.2.3 on 2021-06-03 04:38
+
+import django.db.models.deletion
+from django.conf import settings
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
+        ("api", "0013_merge_20210528_1016"),
+    ]
+
+    operations = [
+        migrations.AlterField(
+            model_name="annotationrelations",
+            name="timestamp",
+            field=models.DateTimeField(),
+        ),
+        migrations.AlterField(
+            model_name="annotationrelations",
+            name="type",
+            field=models.ForeignKey(
+                on_delete=django.db.models.deletion.CASCADE, related_name="annotation_relations", to="api.relationtypes"
+            ),
+        ),
+        migrations.AlterField(
+            model_name="annotationrelations",
+            name="user",
+            field=models.ForeignKey(
+                on_delete=django.db.models.deletion.CASCADE,
+                related_name="annotation_relations",
+                to=settings.AUTH_USER_MODEL,
+            ),
+        ),
+        migrations.AlterField(
+            model_name="relationtypes",
+            name="color",
+            field=models.TextField(),
+        ),
+        migrations.AlterField(
+            model_name="relationtypes",
+            name="name",
+            field=models.TextField(),
+        ),
+        migrations.AlterUniqueTogether(
+            name="annotationrelations",
+            unique_together={("annotation_id_1", "annotation_id_2", "type", "project")},
+        ),
+        migrations.AlterUniqueTogether(
+            name="relationtypes",
+            unique_together={("color", "name")},
+        ),
+    ]
+
+
+Summary:
+Class Migration: A Django migration that modifies fields and establishes unique constraints for the `annotationrelations` and `relationtypes` models in the application.
+
+Code Element Summaries:
+- Class Migration: A Django migration that alters fields and sets unique constraints for the `annotationrelations` and `relationtypes` models within the application.
+
+
+=== File 20 ===
+Project Path: C:\Users\Yifan\Desktop\839\839-project\dataset\doccano-master\backend\data_import\tests\test_catalog.py
+File Name: test_catalog.py
+
+Code:
+import unittest
+
+from data_import.pipeline.catalog import Options
+from projects.models import ProjectType
+
+
+class TestOptions(unittest.TestCase):
+    def test_return_at_least_one_option(self):
+        for task in ProjectType:
+            with self.subTest(task=task):
+                options = Options.filter_by_task(task)
+                self.assertGreaterEqual(len(options), 1)
+
+
+Summary:
+Class TestOptions: A unit test that ensures every task in the ProjectType enumeration has at least one corresponding option in the Options filter.
+
+Code Element Summaries:
+- Class TestOptions: A unit test that verifies at least one option is returned for each task in the ProjectType enumeration.
+- Function `test_return_at_least_one_option`: A test that verifies each task in ProjectType has at least one associated option in the Options filter.
+
